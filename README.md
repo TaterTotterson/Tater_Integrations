@@ -1,5 +1,14 @@
 # Tater Integrations
 
+<div align="center">
+  <a href="https://taterassistant.com">
+    <img src="images/tater-repo-logo.png" alt="Tater Integrations" width="460"/>
+  </a>
+</div>
+<h3 align="center">
+  <a href="https://taterassistant.com">taterassistant.com</a>
+</h3>
+
 Modular integration source for Tater. Tater downloads a module from `manifest.json` into its local `integrations/` runtime directory only when that integration is enabled in Tater.
 
 ## How this repo works
