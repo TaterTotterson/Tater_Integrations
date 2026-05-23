@@ -1,0 +1,136 @@
+{
+  "name": "Tater Integrations",
+  "repo_name": "Tater_Integrations",
+  "description": "Modular integration modules for Tater.",
+  "integrations": [
+    {
+      "id": "aladdin",
+      "name": "Aladdin Connect",
+      "description": "Direct Genie/Aladdin garage door login used by Tater garage door actions.",
+      "version": "1.1.0",
+      "entry": "integrations/aladdin.py",
+      "sha256": "5480e9e03bafed033e6202c9cefdeac42901f7e2e69bc3b7fc1a52d198506802",
+      "required": false
+    },
+    {
+      "id": "brave_search",
+      "name": "Brave Search",
+      "description": "Adds Brave Search as a downloadable web search provider for Tater.",
+      "version": "1.0.0",
+      "entry": "integrations/brave_search.py",
+      "sha256": "a22c764235242d5b7815cdc145007696157e536e30482f5f02cdd1c168af02e8",
+      "required": false,
+      "capabilities": ["web_search"],
+      "redis_hashes": ["brave_search_settings"],
+      "redis_strings": ["tater:web_search:brave_api_key"]
+    },
+    {
+      "id": "google_search",
+      "name": "Google Custom Search",
+      "description": "Adds Google Custom Search as a downloadable web search provider for Tater.",
+      "version": "1.0.0",
+      "entry": "integrations/google_search.py",
+      "sha256": "12337214969857ede17bb315925af15295b074ed8d76f159edfbce1d561db7ac",
+      "required": false,
+      "capabilities": ["web_search"],
+      "redis_hashes": ["google_search_settings", "verba_settings:Web Search"],
+      "redis_strings": ["tater:web_search:google_api_key", "tater:web_search:google_cx"]
+    },
+    {
+      "id": "homeassistant",
+      "name": "Home Assistant",
+      "description": "Shared Home Assistant endpoint and token for portals, verbas, and announcement paths.",
+      "version": "1.1.0",
+      "entry": "integrations/homeassistant.py",
+      "sha256": "664ef0e43bcb5148bfdcedef8a34b5be7c7ea087f2da700fd7d938a94920f513",
+      "required": false
+    },
+    {
+      "id": "homekit",
+      "name": "Ecobee (HomeKit)",
+      "description": "Pair an Ecobee thermostat directly through HomeKit using the setup code.",
+      "version": "1.1.0",
+      "entry": "integrations/homekit.py",
+      "sha256": "ac07a4c848c02db58533294d7a531477d1df031bd1a19e62004fb66179c795f3",
+      "required": false
+    },
+    {
+      "id": "hue",
+      "name": "Philips Hue",
+      "description": "Hue Bridge pairing and app key used by Tater lighting actions.",
+      "version": "1.1.0",
+      "entry": "integrations/hue.py",
+      "sha256": "4dae26a0ea8f75c08e882c783a76a692220b00b57e83792eb56c0ca194846c91",
+      "required": false
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "description": "Optional access token used when Tater auto-downloads Hugging Face models.",
+      "version": "1.0.0",
+      "entry": "integrations/huggingface.py",
+      "sha256": "c48e596a8a6301825c20762c2af5dfffd2ca9bc3b00be52cf49cc9b6e2421537",
+      "required": false
+    },
+    {
+      "id": "searxng_search",
+      "name": "SearXNG",
+      "description": "Adds a self-hosted SearXNG instance as a downloadable web search provider for Tater.",
+      "version": "1.0.0",
+      "entry": "integrations/searxng_search.py",
+      "sha256": "3ff7cae7600688f04bf2cd672dcc277f72a9bac9c19ab2176adc27229840c1dc",
+      "required": false,
+      "capabilities": ["web_search"],
+      "redis_hashes": ["searxng_search_settings"],
+      "redis_strings": ["tater:web_search:searxng_url", "tater:web_search:searxng_api_key"]
+    },
+    {
+      "id": "serper_search",
+      "name": "Serper",
+      "description": "Adds Serper Google Search API as a downloadable web search provider for Tater.",
+      "version": "1.0.0",
+      "entry": "integrations/serper_search.py",
+      "sha256": "e04814f794f23d13c3db906d19162359afdb7ef01eae4de050347c77667927f4",
+      "required": false,
+      "capabilities": ["web_search"],
+      "redis_hashes": ["serper_search_settings"],
+      "redis_strings": ["tater:web_search:serper_api_key"]
+    },
+    {
+      "id": "sonos",
+      "name": "Sonos",
+      "description": "Sonos speaker discovery and direct playback targets for announcements.",
+      "version": "1.1.0",
+      "entry": "integrations/sonos.py",
+      "sha256": "0cda8f3cb97dbc81cc6dae00a8ac74423015519b7c0d7b70acb2419426750997",
+      "required": false
+    },
+    {
+      "id": "unifi_network",
+      "name": "UniFi Network",
+      "description": "UniFi Network API key for client and device inventory actions.",
+      "version": "1.1.0",
+      "entry": "integrations/unifi_network.py",
+      "sha256": "5e0ba7071d58f47ee5279902d7ef5f6e9c606432200e859d5348a722a61f887d",
+      "required": false
+    },
+    {
+      "id": "unifi_protect",
+      "name": "UniFi Protect",
+      "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
+      "version": "1.1.0",
+      "entry": "integrations/unifi_protect.py",
+      "sha256": "ebb206e48f93443110f30eadfa7c3f74f2dfe331d710975b6d61533f60aed8cc",
+      "required": false
+    },
+    {
+      "id": "weather_api",
+      "name": "WeatherAPI.com",
+      "description": "WeatherAPI.com key and defaults used by weather forecast tools.",
+      "version": "1.0.0",
+      "entry": "integrations/weather_api.py",
+      "sha256": "7c44a2ff773b9d617f8867869a71e05eca0532c5974afd803fff3c624b202b31",
+      "required": false
+    }
+  ]
+}
