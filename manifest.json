@@ -100,9 +100,9 @@
       "id": "shelly",
       "name": "Shelly",
       "description": "Local Shelly device discovery and direct HTTP control for switches, lights, covers, and sensors.",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "entry": "integrations/shelly.py",
-      "sha256": "70b10a14fd899af993e8b33c753538b63b0059a93281b08b05f21c1ae69d81f7",
+      "sha256": "b50563bcf03a9328e625eba2920945ef0b46bc81fe689e5cf182ab5981009ca3",
       "required": false,
       "redis_hashes": ["shelly_settings"],
       "redis_strings": ["tater:shelly:devices:registry:v1"]
