@@ -117,6 +117,17 @@
       "required": false
     },
     {
+      "id": "roon",
+      "name": "Roon",
+      "description": "Roon Core pairing and zone transport controls for music playback targets.",
+      "version": "1.0.0",
+      "entry": "integrations/roon.py",
+      "sha256": "fdfdaab9d7edf6a99de09b6afc860b53c35af981ee7cdd657d89fe9e52ef996f",
+      "required": false,
+      "redis_hashes": ["roon_settings"],
+      "redis_strings": ["tater:roon:zones:registry:v1"]
+    },
+    {
       "id": "unifi_network",
       "name": "UniFi Network",
       "description": "UniFi Network API key for client and device inventory actions.",
