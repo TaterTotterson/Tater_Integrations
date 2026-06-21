@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import contextlib
 import json
@@ -16,7 +16,8 @@ ROON_SETTINGS_KEY = "roon_settings"
 ROON_ZONE_CACHE_KEY = "tater:roon:zones:registry:v1"
 ROON_ZONE_CACHE_TTL_SECONDS = 60
 ROON_DEFAULT_ENABLED = True
-ROON_DEFAULT_CORE_PORT = 9330
+ROON_DEFAULT_CORE_PORT = 9100
+ROON_LEGACY_DEFAULT_CORE_PORT = 9330
 ROON_DEFAULT_TIMEOUT_SECONDS = 10
 ROON_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3
 ROON_EXTENSION_ID = "com.taterassistant.roon"
@@ -695,6 +696,17 @@ def _core_candidates(settings: Dict[str, Any], *, discover: bool = True) -> List
     candidates: List[Dict[str, Any]] = []
     configured = _configured_core(settings)
     if configured:
+        configured_port = _bounded_int(
+            configured.get("port"),
+            default=ROON_DEFAULT_CORE_PORT,
+            minimum=1,
+            maximum=65535,
+        )
+        if configured_port == ROON_LEGACY_DEFAULT_CORE_PORT:
+            corrected = dict(configured)
+            corrected["port"] = ROON_DEFAULT_CORE_PORT
+            corrected["source"] = "settings-default-port-fallback"
+            candidates.append(corrected)
         candidates.append(configured)
     if discover:
         timeout = _bounded_int(
