@@ -2,6 +2,7 @@ from __future__ import annotations
 __version__ = "1.1.0"
 
 import contextlib
+import html
 import json
 import socket
 import time
@@ -22,6 +23,7 @@ SONOS_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 2
 SONOS_DISCOVERY_CACHE_KEY = "tater:sonos:speakers:registry:v1"
 SONOS_DISCOVERY_CACHE_TTL_SECONDS = 60.0
 SONOS_AVTRANSPORT_SERVICE = "urn:schemas-upnp-org:service:AVTransport:1"
+SONOS_ZONE_GROUP_TOPOLOGY_SERVICE = "urn:schemas-upnp-org:service:ZoneGroupTopology:1"
 SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS = 30.0
 
 INTEGRATION = {
@@ -189,6 +191,15 @@ def _xml_find_text(root: ET.Element, tag: str) -> str:
     return _text(node.text if node is not None else "")
 
 
+def _xml_local_name(tag: Any) -> str:
+    text = str(tag or "")
+    return text.rsplit("}", 1)[-1] if "}" in text else text
+
+
+def _xml_attr_bool(value: Any) -> bool:
+    return _text(value).lower() in {"1", "true", "yes", "on"}
+
+
 def _parse_sonos_description(location_url: str, *, timeout_s: float) -> Dict[str, str]:
     location = _text(location_url)
     if not location:
@@ -352,6 +363,346 @@ def _dedupe_sonos_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 
+def _sonos_soap_action(
+    root_url: str,
+    *,
+    action: str,
+    inner_xml: str,
+    timeout_s: float,
+    service: str = SONOS_AVTRANSPORT_SERVICE,
+    control_path: str = "/MediaRenderer/AVTransport/Control",
+) -> str:
+    root = normalize_sonos_root(root_url)
+    if not root:
+        raise RuntimeError("Sonos speaker root URL is missing.")
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>"
+        f'<u:{action} xmlns:u="{service}">'
+        f"{inner_xml}"
+        f"</u:{action}>"
+        "</s:Body>"
+        "</s:Envelope>"
+    )
+    response = requests.post(
+        f"{root}{control_path}",
+        data=body.encode("utf-8"),
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPACTION": f'"{service}#{action}"',
+        },
+        timeout=max(2.0, float(timeout_s or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS)),
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Sonos {action} HTTP {response.status_code}: {_text(response.text)[:200]}")
+    return _text(response.text)
+
+
+def _zone_group_state_xml(root_url: str, *, timeout_s: float) -> str:
+    body = _sonos_soap_action(
+        root_url,
+        action="GetZoneGroupState",
+        inner_xml="",
+        timeout_s=timeout_s,
+        service=SONOS_ZONE_GROUP_TOPOLOGY_SERVICE,
+        control_path="/ZoneGroupTopology/Control",
+    )
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return ""
+    for node in root.iter():
+        if _xml_local_name(node.tag) == "ZoneGroupState":
+            return _text(node.text)
+    return ""
+
+
+def _parse_zone_groups(zone_group_state_xml: Any) -> List[Dict[str, Any]]:
+    payload = html.unescape(_text(zone_group_state_xml))
+    if not payload:
+        return []
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return []
+
+    groups: List[Dict[str, Any]] = []
+    for group_node in root.iter():
+        if _xml_local_name(group_node.tag) != "ZoneGroup":
+            continue
+        members: List[Dict[str, Any]] = []
+        for member_node in list(group_node):
+            if _xml_local_name(member_node.tag) != "ZoneGroupMember":
+                continue
+            attrs = {str(key): _text(value) for key, value in dict(member_node.attrib).items()}
+            member_id = sonos_target_id(attrs.get("UUID"))
+            location = _text(attrs.get("Location"))
+            root_url = _root_from_url(location)
+            parsed = urlparse(root_url or location)
+            members.append(
+                {
+                    "id": member_id,
+                    "udn": _text(attrs.get("UUID")),
+                    "name": _text(attrs.get("ZoneName")),
+                    "location": location,
+                    "root_url": root_url,
+                    "host": _text(parsed.hostname),
+                    "invisible": _xml_attr_bool(attrs.get("Invisible")),
+                    "channel_map_set": _text(attrs.get("ChannelMapSet")),
+                    "ht_sat_chan_map_set": _text(attrs.get("HTSatChanMapSet")),
+                    "configuration": _text(attrs.get("Configuration")),
+                    "raw": attrs,
+                }
+            )
+        groups.append(
+            {
+                "id": _text(group_node.attrib.get("ID")),
+                "coordinator": sonos_target_id(group_node.attrib.get("Coordinator")),
+                "members": members,
+            }
+        )
+    return groups
+
+
+def _description_indexes(rows: List[Dict[str, str]]) -> Dict[str, Dict[str, Dict[str, str]]]:
+    by_id: Dict[str, Dict[str, str]] = {}
+    by_root: Dict[str, Dict[str, str]] = {}
+    by_host: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for value in (row.get("id"), row.get("udn")):
+            token = sonos_target_id(value).lower()
+            if token:
+                by_id[token] = row
+        root_url = normalize_sonos_root(row.get("root_url"))
+        if root_url:
+            by_root[root_url.lower()] = row
+        host = _text(row.get("host")).lower()
+        if host:
+            by_host[host] = row
+    return {"id": by_id, "root": by_root, "host": by_host}
+
+
+def _description_for_member(
+    member: Dict[str, Any],
+    indexes: Dict[str, Dict[str, Dict[str, str]]],
+) -> Dict[str, str]:
+    member_id = sonos_target_id(member.get("id") or member.get("udn")).lower()
+    if member_id and member_id in indexes["id"]:
+        return dict(indexes["id"][member_id])
+    root_url = normalize_sonos_root(member.get("root_url") or member.get("location")).lower()
+    if root_url and root_url in indexes["root"]:
+        return dict(indexes["root"][root_url])
+    host = _text(member.get("host")).lower()
+    if host and host in indexes["host"]:
+        return dict(indexes["host"][host])
+    return {}
+
+
+def _member_from_description(row: Dict[str, Any], member_id: str = "") -> Dict[str, Any]:
+    speaker_id = sonos_target_id(member_id or row.get("id") or row.get("udn"))
+    root_url = normalize_sonos_root(row.get("root_url") or row.get("location"))
+    parsed = urlparse(root_url or _text(row.get("location")))
+    return {
+        "id": speaker_id,
+        "udn": _text(row.get("udn")) or (f"uuid:{speaker_id}" if speaker_id else ""),
+        "name": _text(row.get("name")),
+        "location": _text(row.get("location")),
+        "root_url": root_url,
+        "host": _text(row.get("host")) or _text(parsed.hostname),
+        "invisible": False,
+        "channel_map_set": "",
+        "ht_sat_chan_map_set": "",
+        "configuration": "",
+        "raw": {},
+    }
+
+
+def _sonos_ids_from_channel_map(value: Any) -> List[str]:
+    ids: List[str] = []
+    seen: set[str] = set()
+    for part in _text(value).split(";"):
+        raw_id = _text(part.split(":", 1)[0])
+        speaker_id = sonos_target_id(raw_id)
+        if not speaker_id or speaker_id in seen:
+            continue
+        seen.add(speaker_id)
+        ids.append(speaker_id)
+    return ids
+
+
+def _member_is_bonded(member: Dict[str, Any], coordinator_id: str) -> bool:
+    member_id = sonos_target_id(member.get("id") or member.get("udn"))
+    if _xml_attr_bool(member.get("invisible")):
+        return True
+    if member_id and coordinator_id and member_id == coordinator_id:
+        return False
+    return bool(_text(member.get("channel_map_set")) or _text(member.get("ht_sat_chan_map_set")))
+
+
+def _sonos_set_label(kind: str, member_count: int) -> str:
+    if kind == "home_theater":
+        return "Home Theater"
+    if kind == "stereo_pair":
+        return "Stereo Pair"
+    return "Sonos Set" if member_count > 1 else "Speaker"
+
+
+def _sonos_set_kind(members: List[Dict[str, Any]], descriptions: List[Dict[str, str]]) -> str:
+    member_count = len(members)
+    haystack = " ".join(
+        _text(value).lower()
+        for member in members
+        for value in (
+            member.get("ht_sat_chan_map_set"),
+            member.get("channel_map_set"),
+            member.get("configuration"),
+        )
+    )
+    model_haystack = " ".join(_text(desc.get("model")).lower() for desc in descriptions)
+    theater_hints = {"arc", "beam", "playbar", "playbase", "soundbar", "sub", "surround"}
+    if "htsat" in haystack or member_count >= 3 or any(hint in model_haystack for hint in theater_hints):
+        return "home_theater"
+    if member_count == 2:
+        return "stereo_pair"
+    return "set"
+
+
+def _apply_sonos_topology(rows: List[Dict[str, str]], *, timeout_s: float) -> List[Dict[str, str]]:
+    physical_rows = _dedupe_sonos_rows(rows)
+    if not physical_rows:
+        return []
+
+    groups: List[Dict[str, Any]] = []
+    for row in physical_rows:
+        root_url = normalize_sonos_root(row.get("root_url"))
+        if not root_url:
+            continue
+        try:
+            zone_xml = _zone_group_state_xml(root_url, timeout_s=timeout_s)
+        except Exception:
+            zone_xml = ""
+        groups = _parse_zone_groups(zone_xml)
+        if groups:
+            break
+    if not groups:
+        return physical_rows
+
+    indexes = _description_indexes(physical_rows)
+    covered_ids: set[str] = set()
+    target_rows: List[Dict[str, Any]] = []
+
+    for group in groups:
+        members = [dict(item) for item in list(group.get("members") or []) if isinstance(item, dict)]
+        coordinator_id = sonos_target_id(group.get("coordinator"))
+        members_by_id = {
+            sonos_target_id(member.get("id") or member.get("udn")): member
+            for member in members
+            if sonos_target_id(member.get("id") or member.get("udn"))
+        }
+        mapped_member_ids: List[str] = []
+        for member in members:
+            mapped_member_ids.extend(_sonos_ids_from_channel_map(member.get("channel_map_set")))
+            mapped_member_ids.extend(_sonos_ids_from_channel_map(member.get("ht_sat_chan_map_set")))
+        for mapped_id in mapped_member_ids:
+            if mapped_id in members_by_id:
+                continue
+            desc = indexes["id"].get(mapped_id.lower())
+            if not isinstance(desc, dict):
+                continue
+            mapped_member = _member_from_description(desc, mapped_id)
+            members_by_id[mapped_id] = mapped_member
+            members.append(mapped_member)
+
+        bonded_members = [member for member in members if _member_is_bonded(member, coordinator_id)]
+        if mapped_member_ids:
+            bonded_members.extend(
+                member
+                for member_id, member in members_by_id.items()
+                if member_id != coordinator_id and member_id in set(mapped_member_ids)
+            )
+        if not bonded_members:
+            continue
+
+        coordinator_member = next(
+            (member for member in members if sonos_target_id(member.get("id") or member.get("udn")) == coordinator_id),
+            {},
+        )
+        if not coordinator_member:
+            coordinator_member = next((member for member in members if not _member_is_bonded(member, coordinator_id)), {})
+        if not coordinator_member and members:
+            coordinator_member = members[0]
+        if not coordinator_id:
+            coordinator_id = sonos_target_id(coordinator_member.get("id") or coordinator_member.get("udn"))
+        if not coordinator_id:
+            continue
+
+        set_members: List[Dict[str, Any]] = []
+        seen_member_ids: set[str] = set()
+        for member in [coordinator_member, *bonded_members]:
+            member_id = sonos_target_id(member.get("id") or member.get("udn"))
+            if not member_id or member_id in seen_member_ids:
+                continue
+            seen_member_ids.add(member_id)
+            set_members.append(member)
+        if len(set_members) <= 1:
+            continue
+
+        descriptions = [_description_for_member(member, indexes) for member in set_members]
+        coordinator_desc = _description_for_member(coordinator_member, indexes)
+        target = dict(coordinator_desc)
+        target["id"] = coordinator_id
+        target["udn"] = _text(coordinator_desc.get("udn")) or f"uuid:{coordinator_id}"
+        target["root_url"] = normalize_sonos_root(coordinator_desc.get("root_url") or coordinator_member.get("root_url"))
+        target["location"] = _text(coordinator_desc.get("location")) or _text(coordinator_member.get("location"))
+        target["host"] = _text(coordinator_desc.get("host")) or _text(coordinator_member.get("host"))
+
+        base_name = _text(coordinator_member.get("name")) or _text(coordinator_desc.get("name")) or coordinator_id
+        kind = _sonos_set_kind(set_members, descriptions)
+        kind_label = _sonos_set_label(kind, len(set_members))
+        member_names = [_text(member.get("name")) for member in set_members if _text(member.get("name"))]
+        member_ids = [sonos_target_id(member.get("id") or member.get("udn")) for member in set_members]
+        member_hosts = [_text(member.get("host")) for member in set_members if _text(member.get("host"))]
+        member_roots = [
+            normalize_sonos_root(member.get("root_url") or member.get("location"))
+            for member in set_members
+            if normalize_sonos_root(member.get("root_url") or member.get("location"))
+        ]
+
+        target.update(
+            {
+                "name": base_name,
+                "display_name": f"{base_name} {kind_label}",
+                "sonos_target_kind": kind,
+                "sonos_set_label": kind_label,
+                "member_count": str(len(set_members)),
+                "member_ids": member_ids,
+                "member_names": member_names,
+                "member_hosts": member_hosts,
+                "member_root_urls": member_roots,
+                "aliases": [*member_ids, *member_hosts, *member_roots],
+                "coordinator_id": coordinator_id,
+                "zone_group_id": _text(group.get("id")),
+            }
+        )
+        target_rows.append(target)
+        covered_ids.update(member_id for member_id in member_ids if member_id)
+
+    for row in physical_rows:
+        speaker_id = sonos_target_id(row.get("id") or row.get("udn"))
+        if speaker_id and speaker_id in covered_ids:
+            continue
+        next_row = dict(row)
+        next_row.setdefault("sonos_target_kind", "speaker")
+        next_row.setdefault("member_count", "1")
+        target_rows.append(next_row)
+
+    return _dedupe_sonos_rows(target_rows)  # type: ignore[arg-type]
+
+
 def discover_sonos_speakers(*, force: bool = False, timeout_s: Any = None) -> List[Dict[str, str]]:
     settings = read_sonos_settings()
     if not _as_bool(settings.get("SONOS_ENABLED"), SONOS_DEFAULT_ENABLED):
@@ -395,7 +746,7 @@ def discover_sonos_speakers(*, force: bool = False, timeout_s: Any = None) -> Li
                 if row:
                     rows.append(row)
 
-    rows = _dedupe_sonos_rows(rows)
+    rows = _apply_sonos_topology(rows, timeout_s=float(timeout))
     _cache_rows(rows)
     return rows
 
@@ -424,46 +775,17 @@ def resolve_sonos_target(target: Any) -> Dict[str, str]:
             _text(row.get("root_url")).lower(),
             _text(row.get("host")).lower(),
             _text(row.get("name")).lower(),
+            _text(row.get("display_name")).lower(),
         }
+        for key in ("member_ids", "member_hosts", "member_root_urls", "aliases"):
+            values = row.get(key) if isinstance(row.get(key), list) else []
+            aliases.update(_text(item).lower() for item in values if _text(item))
+            aliases.update(sonos_target_id(item).lower() for item in values if sonos_target_id(item))
         if token_l in aliases:
             return row
     if token_l.startswith(("http://", "https://")) or "." in token_l or ":" in token_l:
         return _fetch_sonos_speaker(token, timeout_s=2.0)
     return {}
-
-
-def _sonos_soap_action(
-    root_url: str,
-    *,
-    action: str,
-    inner_xml: str,
-    timeout_s: float,
-) -> None:
-    root = normalize_sonos_root(root_url)
-    if not root:
-        raise RuntimeError("Sonos speaker root URL is missing.")
-    body = (
-        '<?xml version="1.0" encoding="utf-8"?>'
-        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-        "<s:Body>"
-        f'<u:{action} xmlns:u="{SONOS_AVTRANSPORT_SERVICE}">'
-        f"{inner_xml}"
-        f"</u:{action}>"
-        "</s:Body>"
-        "</s:Envelope>"
-    )
-    response = requests.post(
-        f"{root}/MediaRenderer/AVTransport/Control",
-        data=body.encode("utf-8"),
-        headers={
-            "Content-Type": 'text/xml; charset="utf-8"',
-            "SOAPACTION": f'"{SONOS_AVTRANSPORT_SERVICE}#{action}"',
-        },
-        timeout=max(2.0, float(timeout_s or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS)),
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Sonos {action} HTTP {response.status_code}: {_text(response.text)[:200]}")
 
 
 def sonos_play_url_sync(
@@ -563,7 +885,7 @@ def integration_devices() -> Dict[str, Any]:
         devices.append(
             {
                 "id": speaker_id,
-                "name": _text(speaker.get("name")) or _text(speaker.get("host")) or "Sonos Speaker",
+                "name": _text(speaker.get("display_name")) or _text(speaker.get("name")) or _text(speaker.get("host")) or "Sonos Speaker",
                 "type": "speaker",
                 "ref": f"speaker:{speaker_id}" if speaker_id else "",
                 "capabilities": ["speaker", "media_player", "audio_output", "announcement_target", "play_media"],
@@ -575,6 +897,10 @@ def integration_devices() -> Dict[str, Any]:
                     "host": speaker.get("host"),
                     "root_url": speaker.get("root_url"),
                     "udn": speaker.get("udn"),
+                    "sonos_target_kind": speaker.get("sonos_target_kind"),
+                    "member_count": speaker.get("member_count"),
+                    "member_names": speaker.get("member_names"),
+                    "coordinator_id": speaker.get("coordinator_id"),
                 },
             }
         )
