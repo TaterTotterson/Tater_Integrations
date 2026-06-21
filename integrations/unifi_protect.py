@@ -1,9 +1,10 @@
 from __future__ import annotations
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import base64
 import contextlib
 import io
+import json
 import mimetypes
 import os
 import shutil
@@ -23,6 +24,7 @@ UNIFI_PROTECT_BASE_URL_KEY = "tater:unifi_protect:base_url"
 UNIFI_PROTECT_API_KEY_KEY = "tater:unifi_protect:api_key"
 UNIFI_PROTECT_DEFAULT_BASE_URL = "https://10.4.20.127"
 DEFAULT_UNIFI_PROTECT_AUDIO_TIMEOUT_SECONDS = 90.0
+INTEGRATION_RUNTIME_POLL_SECONDS = 2
 UNIFI_PROTECT_CAMERA_PATHS = [
     "/proxy/protect/integration/v1/cameras",
     "/proxy/protect/api/cameras",
@@ -563,6 +565,106 @@ def _unifi_sensor_event_sources(row: Dict[str, Any], ref: str, sensor_kind: str)
     if not out:
         out.append({"type": "connectivity", "ref": ref, "state_on": "online", "state_off": "offline"})
     return out
+
+
+def _unifi_sensor_ref(sensor_id: Any, fallback: Any = "") -> str:
+    token = _text(sensor_id).lower()
+    if token:
+        return f"binary_sensor.unifi_sensor_{token}"
+    name = _text(fallback)
+    return f"sensor:{name}" if name else ""
+
+
+def _runtime_cursor_map(cursor: Any) -> Dict[str, Dict[str, Any]]:
+    if isinstance(cursor, str):
+        try:
+            cursor = json.loads(cursor)
+        except Exception:
+            cursor = {}
+    if not isinstance(cursor, dict):
+        return {}
+    states = cursor.get("states") if isinstance(cursor.get("states"), dict) else cursor
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in (states or {}).items():
+        key_text = _text(key)
+        if not key_text:
+            continue
+        out[key_text] = value if isinstance(value, dict) else {"state": _text(value)}
+    return out
+
+
+def _runtime_sensor_state_payload(row: Dict[str, Any], ref: str, sensor_kind: str) -> Dict[str, Any]:
+    sensor_id = _first_text(row, "id", "_id", "uuid")
+    name = _first_text(row, "name", "displayName", "friendlyName") or sensor_id or ref
+    state = _unifi_sensor_state(row)
+    attrs = {
+        "friendly_name": name,
+        "device_id": sensor_id,
+        "sensor_kind": sensor_kind,
+        "mount_type": _first_text(row, "mountType", "mount_type"),
+        "model": _first_text(row, "model", "modelKey", "marketName"),
+    }
+    return {
+        "entity_id": ref,
+        "id": ref,
+        "device_id": sensor_id,
+        "name": name,
+        "state": state,
+        "attributes": {key: value for key, value in attrs.items() if value not in (None, "")},
+    }
+
+
+def integration_runtime_poll(*, client: Any = None, cursor: Any = None) -> Dict[str, Any]:
+    """Publish contact sensor state edges from the sensor API as a websocket fallback."""
+    del client
+    if not unifi_protect_configured():
+        return {"states": [], "events": [], "cursor": {"states": {}}}
+
+    previous = _runtime_cursor_map(cursor)
+    current: Dict[str, Dict[str, Any]] = {}
+    states: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
+    for row in list_unifi_sensors():
+        if not isinstance(row, dict):
+            continue
+        sensor_id = _first_text(row, "id", "_id", "uuid")
+        name = _first_text(row, "name", "displayName", "friendlyName") or sensor_id
+        sensor_kind = _unifi_sensor_kind(row)
+        if sensor_kind not in {"door", "window", "garage", "contact"}:
+            continue
+        ref = _unifi_sensor_ref(sensor_id, name)
+        if not ref:
+            continue
+        payload = _runtime_sensor_state_payload(row, ref, sensor_kind)
+        state = _text(payload.get("state"))
+        current[ref] = {
+            "state": state,
+            "name": _text(payload.get("name")),
+            "sensor_kind": sensor_kind,
+            "device_id": sensor_id,
+        }
+        states.append(payload)
+
+        old = previous.get(ref)
+        old_state = _text((old or {}).get("state"))
+        if not old_state or old_state == state:
+            continue
+        attrs = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+        events.append(
+            {
+                "kind": "state_changed",
+                "payload": {
+                    "entity_id": ref,
+                    "device_id": sensor_id,
+                    "source": "poll",
+                    "new_state": {"state": state, "attributes": attrs},
+                    "old_state": {"state": old_state, "attributes": attrs},
+                },
+            }
+        )
+
+    return {"states": states, "events": events, "cursor": {"states": current}}
 
 
 def integration_devices() -> Dict[str, Any]:
