@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import contextlib
 import json
@@ -16,8 +16,8 @@ ROON_SETTINGS_KEY = "roon_settings"
 ROON_ZONE_CACHE_KEY = "tater:roon:zones:registry:v1"
 ROON_ZONE_CACHE_TTL_SECONDS = 60
 ROON_DEFAULT_ENABLED = True
-ROON_DEFAULT_CORE_PORT = 9100
-ROON_LEGACY_DEFAULT_CORE_PORT = 9330
+ROON_DEFAULT_CORE_PORT = 9330
+ROON_FALLBACK_CORE_PORTS = (9100,)
 ROON_DEFAULT_TIMEOUT_SECONDS = 10
 ROON_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3
 ROON_EXTENSION_ID = "com.taterassistant.roon"
@@ -591,7 +591,15 @@ class RoonClient:
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting for Roon response to {name}.")
             self._ws.settimeout(max(0.05, remaining))
-            incoming = self._ws.recv()
+            try:
+                incoming = self._ws.recv()
+            except (socket.timeout, TimeoutError) as exc:
+                raise TimeoutError(f"Timed out waiting for Roon response to {name}.") from exc
+            except Exception as exc:
+                timeout_exc = getattr(self._websocket_module, "WebSocketTimeoutException", None)
+                if timeout_exc is not None and isinstance(exc, timeout_exc):
+                    raise TimeoutError(f"Timed out waiting for Roon response to {name}.") from exc
+                raise
             message = _parse_moo_message(incoming)
             if _text(message.get("verb")) == "REQUEST":
                 self._respond_to_request(message)
@@ -702,12 +710,14 @@ def _core_candidates(settings: Dict[str, Any], *, discover: bool = True) -> List
             minimum=1,
             maximum=65535,
         )
-        if configured_port == ROON_LEGACY_DEFAULT_CORE_PORT:
-            corrected = dict(configured)
-            corrected["port"] = ROON_DEFAULT_CORE_PORT
-            corrected["source"] = "settings-default-port-fallback"
-            candidates.append(corrected)
         candidates.append(configured)
+        for fallback_port in ROON_FALLBACK_CORE_PORTS:
+            if configured_port == fallback_port:
+                continue
+            fallback = dict(configured)
+            fallback["port"] = fallback_port
+            fallback["source"] = "settings-port-fallback"
+            candidates.append(fallback)
     if discover:
         timeout = _bounded_int(
             settings.get("ROON_DISCOVERY_TIMEOUT_SECONDS"),
