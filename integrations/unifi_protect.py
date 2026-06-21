@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 import base64
 import contextlib
@@ -9,6 +9,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import warnings
 import wave
@@ -35,6 +36,12 @@ UNIFI_PROTECT_SENSOR_PATHS = [
     "/proxy/protect/api/sensors",
     "/proxy/protect/api/bootstrap",
 ]
+
+
+def _subprocess_spawn_kwargs() -> Dict[str, Any]:
+    if sys.platform == "darwin":
+        return {"close_fds": False}
+    return {}
 
 INTEGRATION = {
     "id": "unifi_protect",
@@ -910,7 +917,14 @@ def play_unifi_protect_audio_sync(
                     "rtp",
                     stream_url,
                 ]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=run_timeout, check=False)
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=run_timeout,
+                    check=False,
+                    **_subprocess_spawn_kwargs(),
+                )
                 if proc.returncode == 0:
                     sent_count += 1
                     continue

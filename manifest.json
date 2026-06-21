@@ -140,9 +140,9 @@
       "id": "unifi_protect",
       "name": "UniFi Protect",
       "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "entry": "integrations/unifi_protect.py",
-      "sha256": "48555ce884725fcb0859636ad3c6fafca82bfa7c17a0655ec06382c166f09f05",
+      "sha256": "fecbe4a7099525b5cf5e517f7656e093bb196f2a60451ab7a027290066dc3274",
       "required": false
     },
     {
