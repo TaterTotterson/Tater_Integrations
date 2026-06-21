@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import base64
 import contextlib
@@ -23,6 +23,16 @@ UNIFI_PROTECT_BASE_URL_KEY = "tater:unifi_protect:base_url"
 UNIFI_PROTECT_API_KEY_KEY = "tater:unifi_protect:api_key"
 UNIFI_PROTECT_DEFAULT_BASE_URL = "https://10.4.20.127"
 DEFAULT_UNIFI_PROTECT_AUDIO_TIMEOUT_SECONDS = 90.0
+UNIFI_PROTECT_CAMERA_PATHS = [
+    "/proxy/protect/integration/v1/cameras",
+    "/proxy/protect/api/cameras",
+    "/proxy/protect/api/bootstrap",
+]
+UNIFI_PROTECT_SENSOR_PATHS = [
+    "/proxy/protect/integration/v1/sensors",
+    "/proxy/protect/api/sensors",
+    "/proxy/protect/api/bootstrap",
+]
 
 INTEGRATION = {
     "id": "unifi_protect",
@@ -49,7 +59,7 @@ INTEGRATION = {
         {
             "id": "test",
             "label": "Test UniFi Protect",
-            "status": "Checks the Protect integration API and counts cameras.",
+            "status": "Checks the Protect API and counts cameras plus sensors.",
         },
     ],
 }
@@ -122,22 +132,34 @@ def unifi_protect_request(
     method: str,
     path: str,
     *,
+    base_url: Any = None,
+    api_key: Any = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
     stream: bool = False,
     timeout_s: float = 20.0,
 ) -> Any:
-    conf = load_unifi_protect_config(required=True)
+    if base_url is None or api_key is None:
+        conf = load_unifi_protect_config(required=True)
+        base = conf["base"]
+        key = conf["api_key"]
+    else:
+        base = _text(base_url).rstrip("/")
+        key = _text(api_key)
     url_path = path if _text(path).startswith("/") else f"/{path}"
-    req_headers = unifi_protect_headers(conf["api_key"], json_content=not stream)
+    if not base:
+        raise ValueError("UniFi Protect base URL is required.")
+    if not key:
+        raise ValueError("UniFi Protect API key is required.")
+    req_headers = unifi_protect_headers(key, json_content=not stream)
     if headers:
         req_headers.update(headers)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", InsecureRequestWarning)
         resp = requests.request(
             method,
-            f"{conf['base']}{url_path}",
+            f"{base}{url_path}",
             headers=req_headers,
             params=params,
             json=json_body,
@@ -153,6 +175,63 @@ def unifi_protect_request(
         return resp.json()
     except Exception:
         return {}
+
+
+def _payload_rows(payload: Any, *preferred_keys: str) -> Tuple[List[Dict[str, Any]], bool]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)], True
+    if not isinstance(payload, dict):
+        return [], False
+
+    keys = list(preferred_keys) + ["data", "items", "results"]
+    seen: set[str] = set()
+    for key in keys:
+        if not key or key in seen or key not in payload:
+            continue
+        seen.add(key)
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)], True
+        if isinstance(value, dict):
+            return [item for item in value.values() if isinstance(item, dict)], True
+
+    values = list(payload.values())
+    if values and all(isinstance(item, dict) for item in values):
+        return [item for item in values if isinstance(item, dict)], True
+    return [], False
+
+
+def _list_unifi_rows(
+    paths: List[str],
+    *payload_keys: str,
+    base_url: Any = None,
+    api_key: Any = None,
+    timeout_s: float = 20.0,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    warnings_out: List[str] = []
+    first_empty_success: Optional[List[Dict[str, Any]]] = None
+    for path in paths:
+        try:
+            payload = unifi_protect_request(
+                "GET",
+                path,
+                base_url=base_url,
+                api_key=api_key,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            warnings_out.append(f"{path}: {exc}")
+            continue
+
+        rows, matched = _payload_rows(payload, *payload_keys)
+        if rows:
+            return rows, warnings_out
+        if matched and first_empty_success is None:
+            first_empty_success = []
+
+    if first_empty_success is not None:
+        return first_empty_success, warnings_out
+    return [], warnings_out
 
 
 def unifi_camera_entity(camera_id: Any) -> str:
@@ -209,13 +288,13 @@ def unifi_camera_has_speaker_hint(row: Dict[str, Any]) -> bool:
 
 
 def list_unifi_cameras() -> List[Dict[str, Any]]:
-    payload = unifi_protect_request("GET", "/proxy/protect/integration/v1/cameras", timeout_s=20.0)
-    return payload if isinstance(payload, list) else []
+    rows, _warnings = _list_unifi_rows(UNIFI_PROTECT_CAMERA_PATHS, "cameras", timeout_s=20.0)
+    return rows
 
 
 def list_unifi_sensors() -> List[Dict[str, Any]]:
-    payload = unifi_protect_request("GET", "/proxy/protect/integration/v1/sensors", timeout_s=20.0)
-    return payload if isinstance(payload, list) else []
+    rows, _warnings = _list_unifi_rows(UNIFI_PROTECT_SENSOR_PATHS, "sensors", timeout_s=20.0)
+    return rows
 
 
 def _first_text(row: Dict[str, Any], *keys: str) -> str:
@@ -227,13 +306,19 @@ def _first_text(row: Dict[str, Any], *keys: str) -> str:
 
 
 def _protect_bool_status(row: Dict[str, Any]) -> str:
-    for key in ("state", "status", "connectionState", "connection_state"):
-        value = _text(row.get(key))
-        if value:
-            return value
     for key in ("isConnected", "is_connected", "connected", "isOnline", "is_online"):
         if key in row:
             return "online" if bool(row.get(key)) else "offline"
+    for key in ("state", "status", "connectionState", "connection_state"):
+        value = _text(row.get(key))
+        if not value:
+            continue
+        token = value.lower()
+        if token in {"connected", "online", "up"}:
+            return "online"
+        if token in {"disconnected", "offline", "down"}:
+            return "offline"
+        return value
     return ""
 
 
@@ -244,6 +329,57 @@ def _protect_details(row: Dict[str, Any], keys: List[str]) -> Dict[str, Any]:
         if value not in (None, ""):
             out[key] = value
     return out
+
+
+def _nested_value(row: Dict[str, Any], path: str) -> Any:
+    current: Any = row
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _first_value(row: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = _nested_value(row, key) if "." in key else row.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _bool_value(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    token = _text(value).lower()
+    if token in {"1", "true", "yes", "on", "open", "opened", "active", "detected", "wet", "alarm"}:
+        return True
+    if token in {"0", "false", "no", "off", "closed", "inactive", "clear", "dry", "none"}:
+        return False
+    return None
+
+
+def _sensor_bool(row: Dict[str, Any], *keys: str) -> Optional[bool]:
+    value = _first_value(row, *keys)
+    if value is None:
+        return None
+    return _bool_value(value)
+
+
+def _sensor_stat_value(row: Dict[str, Any], stat: str) -> Any:
+    camel = {
+        "temperature": "temperature",
+        "humidity": "humidity",
+        "light": "light",
+    }.get(stat, stat)
+    return _first_value(
+        row,
+        f"stats.{stat}.value",
+        f"stats.{camel}.value",
+        f"{stat}Stats.value",
+        f"{stat}_stats.value",
+        stat,
+    )
 
 
 def _unifi_camera_is_doorbell(row: Dict[str, Any]) -> bool:
@@ -344,35 +480,100 @@ def _unifi_sensor_kind(row: Dict[str, Any]) -> str:
     name = _text(row.get("name")).lower()
     mount_type = _text(row.get("mountType") or row.get("mount_type")).lower()
     sensor_type = _text(row.get("sensorType") or row.get("sensor_type") or row.get("type")).lower()
-    hint = f"{name} {mount_type} {sensor_type}"
+    model = _text(row.get("model") or row.get("modelKey") or row.get("marketName")).lower()
+    hint = f"{name} {mount_type} {sensor_type} {model}"
     if "garage" in hint:
         return "garage"
     if "window" in hint:
         return "window"
     if any(token in hint for token in ("door", "contact", "open")):
         return "door"
+    if any(token in hint for token in ("leak", "flood", "water")):
+        return "leak"
+    if "motion" in hint or _sensor_bool(row, "isMotionDetected", "is_motion_detected") is not None:
+        return "motion"
+    if _sensor_bool(row, "isOpened", "is_opened", "isOpen", "is_open", "open") is not None:
+        return "contact"
     return "sensor"
 
 
 def _unifi_sensor_capabilities(row: Dict[str, Any]) -> List[str]:
     caps = ["sensor"]
     sensor_kind = _unifi_sensor_kind(row)
-    if sensor_kind in {"door", "window", "garage"}:
-        caps.extend(["entry_sensor", "contact", sensor_kind])
-    text = " ".join(_text(row.get(key)).lower() for key in ("name", "type", "sensorType", "model", "modelKey"))
-    if "motion" in text or row.get("isMotionDetected") is not None:
+    if sensor_kind in {"door", "window", "garage", "contact"}:
+        caps.extend(["entry_sensor", "contact", "open_close"])
+        if sensor_kind in {"door", "window", "garage"}:
+            caps.append(sensor_kind)
+    text = " ".join(_text(row.get(key)).lower() for key in ("name", "type", "sensorType", "sensor_type", "model", "modelKey"))
+    if "motion" in text or _sensor_bool(row, "isMotionDetected", "is_motion_detected") is not None:
         caps.append("motion")
-    if "temp" in text or row.get("temperature") is not None:
+    if "temp" in text or _sensor_stat_value(row, "temperature") is not None:
         caps.append("temperature")
+    if "humid" in text or _sensor_stat_value(row, "humidity") is not None:
+        caps.append("humidity")
+    if any(token in text for token in ("light", "lux", "illuminance")) or _sensor_stat_value(row, "light") is not None:
+        caps.extend(["illuminance", "light_sensor"])
+    if sensor_kind == "leak" or _sensor_bool(row, "isLeakDetected", "is_leak_detected", "leakDetected", "leak_detected") is not None:
+        caps.extend(["leak", "water"])
+    if _first_value(row, "batteryStatus", "battery_status", "batteryLevel", "battery_level", "battery") is not None:
+        caps.append("battery")
+    if _sensor_bool(row, "isTamperingDetected", "is_tampering_detected", "tamperingDetected", "tampering_detected") is not None:
+        caps.append("tamper")
     return list(dict.fromkeys(caps))
+
+
+def _unifi_sensor_state(row: Dict[str, Any]) -> str:
+    opened = _sensor_bool(row, "isOpened", "is_opened", "isOpen", "is_open", "open", "opened", "contactState", "contact_state")
+    if opened is not None:
+        return "open" if opened else "closed"
+    motion = _sensor_bool(row, "isMotionDetected", "is_motion_detected", "motionDetected", "motion_detected")
+    if motion is not None:
+        return "motion" if motion else "clear"
+    leak = _sensor_bool(row, "isLeakDetected", "is_leak_detected", "leakDetected", "leak_detected")
+    if leak is None and _first_value(row, "leakDetectedAt", "leak_detected_at") is not None:
+        leak = True
+    if leak is not None:
+        return "wet" if leak else "dry"
+    alarm = _sensor_bool(row, "isAlarmTriggered", "is_alarm_triggered", "alarmTriggered", "alarm_triggered")
+    if alarm is None and _first_value(row, "alarmTriggeredAt", "alarm_triggered_at") is not None:
+        alarm = True
+    if alarm is not None:
+        return "alarm" if alarm else "clear"
+    status = _protect_bool_status(row)
+    return status or _first_text(row, "state", "status") or "unknown"
+
+
+def _unifi_sensor_event_sources(row: Dict[str, Any], ref: str, sensor_kind: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if _sensor_bool(row, "isOpened", "is_opened", "isOpen", "is_open", "open", "opened", "contactState", "contact_state") is not None or sensor_kind in {"door", "window", "garage", "contact"}:
+        out.append(
+            {
+                "type": sensor_kind if sensor_kind in {"door", "window", "garage"} else "contact",
+                "ref": ref,
+                "state_on": "open",
+                "state_off": "closed",
+            }
+        )
+    if _sensor_bool(row, "isMotionDetected", "is_motion_detected", "motionDetected", "motion_detected") is not None or "motion" in _unifi_sensor_capabilities(row):
+        out.append({"type": "motion", "ref": ref, "state_on": "motion", "state_off": "clear"})
+    if sensor_kind == "leak" or _sensor_bool(row, "isLeakDetected", "is_leak_detected", "leakDetected", "leak_detected") is not None:
+        out.append({"type": "leak", "ref": ref, "state_on": "wet", "state_off": "dry"})
+    if _sensor_bool(row, "isTamperingDetected", "is_tampering_detected", "tamperingDetected", "tampering_detected") is not None:
+        out.append({"type": "tamper", "ref": ref, "state_on": "tamper", "state_off": "clear"})
+    if not out:
+        out.append({"type": "connectivity", "ref": ref, "state_on": "online", "state_off": "offline"})
+    return out
 
 
 def integration_devices() -> Dict[str, Any]:
     if not unifi_protect_configured():
         return {"devices": [], "message": "UniFi Protect is not configured."}
     rows: List[Dict[str, Any]] = []
-    cameras = list_unifi_cameras()
-    sensors = list_unifi_sensors()
+    warnings_out: List[str] = []
+    cameras, camera_warnings = _list_unifi_rows(UNIFI_PROTECT_CAMERA_PATHS, "cameras", timeout_s=20.0)
+    sensors, sensor_warnings = _list_unifi_rows(UNIFI_PROTECT_SENSOR_PATHS, "sensors", timeout_s=20.0)
+    warnings_out.extend(camera_warnings)
+    warnings_out.extend(sensor_warnings)
     for camera in cameras:
         if not isinstance(camera, dict):
             continue
@@ -417,41 +618,57 @@ def integration_devices() -> Dict[str, Any]:
         name = _first_text(sensor, "name", "displayName", "friendlyName") or sensor_id
         sensor_kind = _unifi_sensor_kind(sensor)
         sensor_ref = f"binary_sensor.unifi_sensor_{_text(sensor_id).lower()}" if sensor_id else f"sensor:{name}"
+        sensor_state = _unifi_sensor_state(sensor)
         rows.append(
             {
                 "id": sensor_id or name,
                 "name": name or "Sensor",
-                "type": "entry_sensor" if sensor_kind in {"door", "window", "garage"} else "sensor",
+                "type": "entry_sensor" if sensor_kind in {"door", "window", "garage", "contact"} else "sensor",
                 "ref": sensor_ref,
                 "capabilities": _unifi_sensor_capabilities(sensor),
-                "event_sources": [
-                    {
-                        "type": sensor_kind,
-                        "ref": sensor_ref,
-                        "state_on": "on",
-                        "state_off": "off",
-                    }
-                ],
+                "event_sources": _unifi_sensor_event_sources(sensor, sensor_ref, sensor_kind),
                 "status": _protect_bool_status(sensor),
-                "state": _first_text(sensor, "state", "status"),
+                "state": sensor_state,
                 "details": _protect_details(
                     sensor,
                     [
                         "model",
                         "modelKey",
                         "marketName",
+                        "type",
+                        "sensorType",
+                        "sensor_type",
+                        "mountType",
+                        "mount_type",
                         "batteryStatus",
+                        "battery_status",
                         "batteryLevel",
+                        "battery_level",
                         "isConnected",
                         "isOpened",
+                        "is_opened",
                         "isMotionDetected",
+                        "is_motion_detected",
+                        "leakDetectedAt",
+                        "leak_detected_at",
                         "alarmTriggeredAt",
+                        "alarm_triggered_at",
+                        "tamperingDetectedAt",
+                        "tampering_detected_at",
+                        "stats",
                         "lastSeen",
+                        "last_seen",
                     ],
                 ),
             }
         )
-    return {"devices": rows, "message": f"UniFi Protect returned {len(rows)} cameras and sensors."}
+    result: Dict[str, Any] = {
+        "devices": rows,
+        "message": f"UniFi Protect returned {len(cameras)} camera{'s' if len(cameras) != 1 else ''} and {len(sensors)} sensor{'s' if len(sensors) != 1 else ''}.",
+    }
+    if warnings_out:
+        result["warnings"] = warnings_out
+    return result
 
 
 def read_integration_settings() -> Dict[str, Any]:
@@ -481,25 +698,31 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
     api_key = _text((payload or {}).get("unifi_protect_api_key") or current.get("unifi_protect_api_key"))
     if not api_key:
         raise ValueError("UniFi Protect API key is required.")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", InsecureRequestWarning)
-        response = requests.get(
-            f"{base}/proxy/protect/integration/v1/cameras",
-            headers=unifi_protect_headers(api_key),
-            timeout=20,
-            verify=False,
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(f"UniFi Protect test failed: HTTP {response.status_code}: {response.text[:200]}")
-    try:
-        cameras = response.json()
-    except Exception as exc:
-        raise RuntimeError(f"UniFi Protect test returned invalid JSON: {exc}") from exc
-    count = len(cameras) if isinstance(cameras, list) else 0
+    cameras, camera_warnings = _list_unifi_rows(
+        UNIFI_PROTECT_CAMERA_PATHS,
+        "cameras",
+        base_url=base,
+        api_key=api_key,
+        timeout_s=20.0,
+    )
+    sensors, sensor_warnings = _list_unifi_rows(
+        UNIFI_PROTECT_SENSOR_PATHS,
+        "sensors",
+        base_url=base,
+        api_key=api_key,
+        timeout_s=20.0,
+    )
+    if not cameras and camera_warnings:
+        raise RuntimeError(f"UniFi Protect test failed: {camera_warnings[-1]}")
     return {
         "ok": True,
-        "camera_count": count,
-        "message": f"UniFi Protect connection worked. Found {count} camera{'s' if count != 1 else ''}.",
+        "camera_count": len(cameras),
+        "sensor_count": len(sensors),
+        "warnings": sensor_warnings,
+        "message": (
+            f"UniFi Protect connection worked. Found {len(cameras)} camera{'s' if len(cameras) != 1 else ''} "
+            f"and {len(sensors)} sensor{'s' if len(sensors) != 1 else ''}."
+        ),
     }
 
 

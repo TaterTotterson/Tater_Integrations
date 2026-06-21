@@ -97,6 +97,17 @@
       "redis_strings": ["tater:web_search:serper_api_key"]
     },
     {
+      "id": "shelly",
+      "name": "Shelly",
+      "description": "Local Shelly device discovery and direct HTTP control for switches, lights, covers, and sensors.",
+      "version": "1.0.0",
+      "entry": "integrations/shelly.py",
+      "sha256": "3abed81d84844e333bed1afe22f9d9c2db7b7b56a465f222b0b35eafda770ede",
+      "required": false,
+      "redis_hashes": ["shelly_settings"],
+      "redis_strings": ["tater:shelly:devices:registry:v1"]
+    },
+    {
       "id": "sonos",
       "name": "Sonos",
       "description": "Sonos speaker discovery and direct playback targets for announcements.",
@@ -118,9 +129,9 @@
       "id": "unifi_protect",
       "name": "UniFi Protect",
       "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "entry": "integrations/unifi_protect.py",
-      "sha256": "ebb206e48f93443110f30eadfa7c3f74f2dfe331d710975b6d61533f60aed8cc",
+      "sha256": "71c217583d3df16a8b8e76a1411516d99d6b959f003ee596424661eb67defc4d",
       "required": false
     },
     {
