@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import contextlib
 import json
@@ -22,6 +22,7 @@ ROON_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3
 ROON_EXTENSION_ID = "com.taterassistant.roon"
 ROON_EXTENSION_NAME = "Tater Roon"
 ROON_TRANSPORT_SERVICE = "com.roonlabs.transport:2"
+ROON_BROWSE_SERVICE = "com.roonlabs.browse:1"
 ROON_PING_SERVICE = "com.roonlabs.ping:1"
 ROON_REGISTRY_SERVICE = "com.roonlabs.registry:1"
 ROON_DISCOVERY_SERVICE_ID = "00720724-5143-4a9b-abac-0e50cba674bb"
@@ -34,7 +35,7 @@ ROON_WEBSITE = "https://taterassistant.com"
 INTEGRATION = {
     "id": "roon",
     "name": "Roon",
-    "description": "Roon Core pairing and zone transport controls for music playback targets.",
+    "description": "Roon Core pairing, zone transport controls, and library browse playback targets.",
     "badge": "RO",
     "order": 55,
     "fields": [
@@ -607,7 +608,7 @@ class RoonClient:
             "publisher": ROON_PUBLISHER,
             "email": ROON_EMAIL,
             "website": ROON_WEBSITE,
-            "required_services": [ROON_TRANSPORT_SERVICE],
+            "required_services": [ROON_TRANSPORT_SERVICE, ROON_BROWSE_SERVICE],
             "optional_services": [],
             "provided_services": [ROON_PING_SERVICE],
         }
@@ -647,6 +648,13 @@ class RoonClient:
         message = self.request(f"{ROON_TRANSPORT_SERVICE}/{method}", body)
         if _text(message.get("name")) != "Success":
             raise RuntimeError(f"Roon transport {method} failed: {_text(message.get('name')) or message}")
+        payload = message.get("body")
+        return payload if isinstance(payload, dict) else {}
+
+    def browse(self, method: str, body: Any = None) -> Dict[str, Any]:
+        message = self.request(f"{ROON_BROWSE_SERVICE}/{method}", body)
+        if _text(message.get("name")) != "Success":
+            raise RuntimeError(f"Roon browse {method} failed: {_text(message.get('name')) or message}")
         payload = message.get("body")
         return payload if isinstance(payload, dict) else {}
 
@@ -797,10 +805,10 @@ def _zone_device(zone: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, An
     outputs = zone.get("outputs") if isinstance(zone.get("outputs"), list) else []
     output_names = [_text(output.get("display_name")) for output in outputs if isinstance(output, dict)]
     output_names = [name for name in output_names if name]
-    capabilities = ["speaker", "media_player", "audio_output", "music", "roon", "roon_zone"]
+    capabilities = ["speaker", "media_player", "audio_output", "music", "library_browse", "roon", "roon_zone"]
     if _zone_volume_summary(zone):
         capabilities.extend(["volume", "mute"])
-    actions = ["play", "pause", "playpause", "stop", "next", "previous"]
+    actions = ["play", "pause", "playpause", "stop", "next", "previous", "play_media", "queue_media"]
     if "volume" in capabilities:
         actions.extend(["set_volume", "volume_up", "volume_down", "mute", "unmute"])
     return {
@@ -878,6 +886,435 @@ def _volume_outputs(zone: Dict[str, Any], output_id: Any = None) -> List[Dict[st
     if not matches:
         raise ValueError("Roon zone has no controllable volume output.")
     return matches
+
+
+def _norm_media_kind(value: Any) -> str:
+    token = _text(value).lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "song": "track",
+        "songs": "track",
+        "tracks": "track",
+        "band": "artist",
+        "artists": "artist",
+        "albums": "album",
+        "genres": "genre",
+        "playlists": "playlist",
+        "stations": "radio",
+        "station": "radio",
+        "internet_radio": "radio",
+    }
+    token = aliases.get(token, token)
+    return token if token in {"track", "artist", "album", "genre", "playlist", "radio", "any"} else "any"
+
+
+def _media_hierarchy(media_kind: str) -> str:
+    return {
+        "artist": "artists",
+        "album": "albums",
+        "genre": "genres",
+        "playlist": "playlists",
+        "radio": "internet_radio",
+    }.get(media_kind, "browse")
+
+
+def _browse_load_items(
+    client: RoonClient,
+    *,
+    hierarchy: str,
+    session_key: str,
+    offset: int = 0,
+    count: int = 100,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    result = client.browse(
+        "load",
+        {
+            "hierarchy": hierarchy,
+            "multi_session_key": session_key,
+            "offset": offset,
+            "count": count,
+            "set_display_offset": offset,
+        },
+    )
+    items = result.get("items") if isinstance(result.get("items"), list) else []
+    return [item for item in items if isinstance(item, dict)], result
+
+
+def _browse_select(
+    client: RoonClient,
+    *,
+    hierarchy: str,
+    session_key: str,
+    zone_id: str,
+    item: Dict[str, Any],
+    input_text: str = "",
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "hierarchy": hierarchy,
+        "multi_session_key": session_key,
+        "zone_or_output_id": zone_id,
+        "item_key": item.get("item_key"),
+    }
+    if input_text:
+        body["input"] = input_text
+    return client.browse("browse", body)
+
+
+def _browse_list(
+    client: RoonClient,
+    *,
+    hierarchy: str,
+    session_key: str,
+    zone_id: str,
+    pop_all: bool = True,
+    input_text: str = "",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    body: Dict[str, Any] = {
+        "hierarchy": hierarchy,
+        "multi_session_key": session_key,
+        "zone_or_output_id": zone_id,
+    }
+    if pop_all:
+        body["pop_all"] = True
+    if input_text:
+        body["input"] = input_text
+    result = client.browse("browse", body)
+    if _text(result.get("action")) != "list":
+        return [], result
+    items, _loaded = _browse_load_items(client, hierarchy=hierarchy, session_key=session_key, count=100)
+    return items, result
+
+
+def _browse_item_label(item: Dict[str, Any]) -> str:
+    title = _text(item.get("title"))
+    subtitle = _text(item.get("subtitle"))
+    return " - ".join(part for part in (title, subtitle) if part)
+
+
+def _browse_words(value: Any) -> set[str]:
+    return {token for token in re.split(r"[^a-z0-9]+", _text(value).lower()) if token}
+
+
+def _is_browse_header(item: Dict[str, Any]) -> bool:
+    return _text(item.get("hint")).lower() == "header" or not _text(item.get("item_key"))
+
+
+def _action_item_score(item: Dict[str, Any], *, media_kind: str, randomize: bool, enqueue: bool) -> int:
+    if _is_browse_header(item):
+        return -1
+    title = _text(item.get("title")).lower()
+    hint = _text(item.get("hint")).lower()
+    if hint not in {"action", "action_list"} and not any(
+        token in title for token in ("play", "shuffle", "radio", "queue", "add")
+    ):
+        return -1
+    score = 0
+    if enqueue:
+        if "add next" in title:
+            score += 900
+        elif "add" in title or "queue" in title:
+            score += 800
+    if randomize:
+        if "shuffle" in title:
+            score += 950
+        elif "radio" in title:
+            score += 780
+    if "play now" in title:
+        score += 760
+    elif title == "play" or title.startswith("play "):
+        score += 700
+    elif "play" in title:
+        score += 500
+    if media_kind in {"artist", "genre", "radio"} and "radio" in title:
+        score += 120
+    if hint == "action":
+        score += 60
+    return score
+
+
+def _choose_action_item(
+    items: List[Dict[str, Any]],
+    *,
+    media_kind: str,
+    randomize: bool,
+    enqueue: bool,
+) -> Optional[Dict[str, Any]]:
+    scored = [(_action_item_score(item, media_kind=media_kind, randomize=randomize, enqueue=enqueue), item) for item in items]
+    scored = [(score, item) for score, item in scored if score >= 500]
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored[0][1]
+
+
+def _browse_item_score(item: Dict[str, Any], *, query: str, media_kind: str) -> int:
+    if _is_browse_header(item):
+        return -1
+    label = _browse_item_label(item)
+    low = label.lower()
+    title = _text(item.get("title")).lower()
+    hint = _text(item.get("hint")).lower()
+    score = 0
+    kind_terms = {
+        "track": {"track", "tracks", "song", "songs"},
+        "artist": {"artist", "artists"},
+        "album": {"album", "albums"},
+        "genre": {"genre", "genres"},
+        "playlist": {"playlist", "playlists"},
+        "radio": {"radio", "stations", "internet radio"},
+    }
+    if media_kind in kind_terms:
+        if title in kind_terms[media_kind]:
+            score += 240
+        elif any(term in low for term in kind_terms[media_kind]):
+            score += 90
+    elif "top result" in low:
+        score += 120
+
+    query_text = _text(query).lower()
+    if query_text:
+        if title == query_text:
+            score += 360
+        elif query_text in title:
+            score += 240
+        elif query_text in low:
+            score += 140
+        overlap = len(_browse_words(query_text) & _browse_words(label))
+        score += overlap * 35
+    if hint == "action_list":
+        score += 25
+    elif hint == "list":
+        score += 15
+    return score
+
+
+def _choose_browse_item(items: List[Dict[str, Any]], *, query: str, media_kind: str) -> Optional[Dict[str, Any]]:
+    scored = [(_browse_item_score(item, query=query, media_kind=media_kind), item) for item in items]
+    scored = [(score, item) for score, item in scored if score > 0]
+    if not scored:
+        candidates = [item for item in items if not _is_browse_header(item)]
+        return candidates[0] if candidates else None
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored[0][1]
+
+
+def _browse_result_message(result: Dict[str, Any]) -> str:
+    message = _text(result.get("message"))
+    if message:
+        return message
+    action = _text(result.get("action"))
+    return f"Roon browse action returned {action or 'success'}."
+
+
+def _activate_browse_items(
+    client: RoonClient,
+    *,
+    hierarchy: str,
+    session_key: str,
+    zone_id: str,
+    items: List[Dict[str, Any]],
+    query: str,
+    media_kind: str,
+    randomize: bool,
+    enqueue: bool,
+    depth: int = 0,
+) -> Dict[str, Any]:
+    if depth > 8:
+        raise RuntimeError("Roon browse search was too deep to resolve a playable item.")
+
+    action_item = _choose_action_item(items, media_kind=media_kind, randomize=randomize, enqueue=enqueue)
+    if action_item:
+        result = _browse_select(client, hierarchy=hierarchy, session_key=session_key, zone_id=zone_id, item=action_item)
+        action = _text(result.get("action"))
+        if action == "list":
+            next_items, _loaded = _browse_load_items(client, hierarchy=hierarchy, session_key=session_key, count=100)
+            return _activate_browse_items(
+                client,
+                hierarchy=hierarchy,
+                session_key=session_key,
+                zone_id=zone_id,
+                items=next_items,
+                query=query,
+                media_kind=media_kind,
+                randomize=randomize,
+                enqueue=enqueue,
+                depth=depth + 1,
+            )
+        if action == "message" and result.get("is_error"):
+            raise RuntimeError(_browse_result_message(result))
+        return {
+            "ok": True,
+            "action": "queue_media" if enqueue else "play_media",
+            "selected": action_item,
+            "message": _browse_result_message(result),
+            "browse_result": result,
+        }
+
+    item = _choose_browse_item(items, query=query, media_kind=media_kind)
+    if not item:
+        raise RuntimeError("Roon did not return a playable match.")
+
+    input_prompt = item.get("input_prompt") if isinstance(item.get("input_prompt"), dict) else {}
+    result = _browse_select(
+        client,
+        hierarchy=hierarchy,
+        session_key=session_key,
+        zone_id=zone_id,
+        item=item,
+        input_text=query if input_prompt and query else "",
+    )
+    action = _text(result.get("action"))
+    if action == "message":
+        if result.get("is_error"):
+            raise RuntimeError(_browse_result_message(result))
+        return {
+            "ok": True,
+            "action": "queue_media" if enqueue else "play_media",
+            "selected": item,
+            "message": _browse_result_message(result),
+            "browse_result": result,
+        }
+    if action in {"none", "replace_item", "remove_item"}:
+        return {
+            "ok": True,
+            "action": "queue_media" if enqueue else "play_media",
+            "selected": item,
+            "message": _browse_result_message(result),
+            "browse_result": result,
+        }
+    if action != "list":
+        raise RuntimeError(_browse_result_message(result))
+
+    next_items, _loaded = _browse_load_items(client, hierarchy=hierarchy, session_key=session_key, count=100)
+    return _activate_browse_items(
+        client,
+        hierarchy=hierarchy,
+        session_key=session_key,
+        zone_id=zone_id,
+        items=next_items,
+        query=query,
+        media_kind=media_kind,
+        randomize=randomize,
+        enqueue=enqueue,
+        depth=depth + 1,
+    )
+
+
+def _search_browse_items(
+    client: RoonClient,
+    *,
+    zone_id: str,
+    session_key: str,
+    query: str,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    errors: List[str] = []
+    try:
+        items, result = _browse_list(
+            client,
+            hierarchy="search",
+            session_key=session_key,
+            zone_id=zone_id,
+            pop_all=True,
+            input_text=query,
+        )
+        if items:
+            return "search", items, result
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        root_items, result = _browse_list(
+            client,
+            hierarchy="search",
+            session_key=session_key,
+            zone_id=zone_id,
+            pop_all=True,
+        )
+        prompt_item = next(
+            (
+                item
+                for item in root_items
+                if isinstance(item.get("input_prompt"), dict) and _text(item.get("item_key"))
+            ),
+            None,
+        )
+        if prompt_item:
+            browse_result = _browse_select(
+                client,
+                hierarchy="search",
+                session_key=session_key,
+                zone_id=zone_id,
+                item=prompt_item,
+                input_text=query,
+            )
+            if _text(browse_result.get("action")) == "list":
+                items, _loaded = _browse_load_items(client, hierarchy="search", session_key=session_key, count=100)
+                if items:
+                    return "search", items, browse_result
+            return "search", root_items, result
+    except Exception as exc:
+        errors.append(str(exc))
+
+    if errors:
+        raise RuntimeError("Roon search failed. " + " | ".join(errors[:2]))
+    raise RuntimeError("Roon search returned no results.")
+
+
+def _play_media_with_browse(
+    client: RoonClient,
+    *,
+    zone_id: str,
+    query: str,
+    media_kind: str,
+    randomize: bool,
+    enqueue: bool,
+) -> Dict[str, Any]:
+    session_key = f"tater-{uuid.uuid4()}"
+    clean_query = _text(query)
+    kind = _norm_media_kind(media_kind)
+
+    if clean_query:
+        hierarchy, items, result = _search_browse_items(
+            client,
+            zone_id=zone_id,
+            session_key=session_key,
+            query=clean_query,
+        )
+        source = result
+    else:
+        hierarchy = _media_hierarchy(kind)
+        items, source = _browse_list(
+            client,
+            hierarchy=hierarchy,
+            session_key=session_key,
+            zone_id=zone_id,
+            pop_all=True,
+        )
+
+    if not items:
+        raise RuntimeError("Roon did not return any browse results.")
+
+    result = _activate_browse_items(
+        client,
+        hierarchy=hierarchy,
+        session_key=session_key,
+        zone_id=zone_id,
+        items=items,
+        query=clean_query,
+        media_kind=kind,
+        randomize=randomize,
+        enqueue=enqueue,
+    )
+    result.update(
+        {
+            "zone_id": zone_id,
+            "query": clean_query,
+            "media_kind": kind,
+            "random": bool(randomize),
+            "enqueue": bool(enqueue),
+            "source_browse": source,
+        }
+    )
+    return result
 
 
 def read_integration_settings() -> Dict[str, Any]:
@@ -1009,9 +1446,12 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     action = _text(action_id).lower()
     action = "playpause" if action in {"toggle", "play_pause"} else action
+    action = "play_media" if action in {"play_query", "play_music", "play_library"} else action
+    action = "queue_media" if action in {"queue_query", "queue_music"} else action
     transport_controls = {"play", "pause", "playpause", "stop", "previous", "next"}
     volume_actions = {"set_volume", "volume_up", "volume_down", "mute", "unmute"}
-    if action not in transport_controls | volume_actions:
+    media_actions = {"play_media", "queue_media"}
+    if action not in transport_controls | volume_actions | media_actions:
         raise KeyError(f"Unsupported Roon device action: {action_id}")
     settings = read_roon_settings()
     result = roon_get_zones(force=True, settings=settings)
@@ -1024,6 +1464,37 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
     port = _bounded_int(core.get("port"), default=ROON_DEFAULT_CORE_PORT, minimum=1, maximum=65535)
     with RoonClient(host, port, timeout_s=settings.get("ROON_TIMEOUT_SECONDS")) as client:
         client.connect_and_register(settings)
+        if action in media_actions:
+            target_id = _text((payload or {}).get("zone_or_output_id")) or _text(zone.get("zone_id"))
+            media_query = _text(
+                (payload or {}).get("query")
+                or (payload or {}).get("request")
+                or (payload or {}).get("media")
+                or (payload or {}).get("title")
+            )
+            media_kind = _norm_media_kind(
+                (payload or {}).get("media_kind")
+                or (payload or {}).get("media_type")
+                or (payload or {}).get("type")
+            )
+            payload_map = payload or {}
+            if "random" in payload_map:
+                randomize = _as_bool(payload_map.get("random"), False)
+            else:
+                randomize = _as_bool(payload_map.get("shuffle"), False)
+            if media_kind in {"artist", "genre", "radio"} and "random" not in payload_map:
+                randomize = True
+            result = _play_media_with_browse(
+                client,
+                zone_id=target_id,
+                query=media_query,
+                media_kind=media_kind,
+                randomize=randomize,
+                enqueue=action == "queue_media",
+            )
+            result["device_id"] = _text(device_id)
+            return result
+
         if action in transport_controls:
             target_id = _text((payload or {}).get("zone_or_output_id")) or _text(zone.get("zone_id"))
             client.transport("control", {"zone_or_output_id": target_id, "control": action})

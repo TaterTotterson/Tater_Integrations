@@ -119,10 +119,10 @@
     {
       "id": "roon",
       "name": "Roon",
-      "description": "Roon Core pairing and zone transport controls for music playback targets.",
-      "version": "1.0.0",
+      "description": "Roon Core pairing, zone transport controls, and library browse playback targets.",
+      "version": "1.1.0",
       "entry": "integrations/roon.py",
-      "sha256": "fdfdaab9d7edf6a99de09b6afc860b53c35af981ee7cdd657d89fe9e52ef996f",
+      "sha256": "017bd4fb2d3f852e15aa321cb4a83732c152138fbbc0af23f91ba1271a464e6f",
       "required": false,
       "redis_hashes": ["roon_settings"],
       "redis_strings": ["tater:roon:zones:registry:v1"]
