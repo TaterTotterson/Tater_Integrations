@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import contextlib
 import ipaddress
@@ -80,7 +80,7 @@ INTEGRATION = {
         {
             "id": "discover",
             "label": "Discover Shelly Devices",
-            "status": "Scans manual hosts and local private networks for Shelly devices.",
+            "status": "Scans local networks and saves discovered Shelly hosts.",
         },
         {
             "id": "test",
@@ -1152,14 +1152,35 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
         devices, failures = shelly_inventory(force=True)
         roots = sorted({_text((item.get("details") or {}).get("root_url")) for item in devices if isinstance(item.get("details"), dict)})
         roots = [root for root in roots if root]
+        current_settings = read_shelly_settings()
+        existing_hosts = _split_manual_hosts(current_settings.get("SHELLY_DEVICE_HOSTS"))
+        existing_keys = {root.lower() for root in existing_hosts}
+        merged_hosts = _dedupe_roots(existing_hosts + roots)
+        added_hosts = [root for root in merged_hosts if root.lower() not in existing_keys]
+        if roots:
+            save_shelly_settings(device_hosts="\n".join(merged_hosts))
+        saved_settings = read_integration_settings()
+        added_text = (
+            f" Added {len(added_hosts)} new host{'s' if len(added_hosts) != 1 else ''} to Manual Device Hosts."
+            if added_hosts
+            else " No new hosts were added."
+        )
         return {
             "ok": True,
             "device_count": len(devices),
             "host_count": len(roots),
+            "saved_host_count": len(merged_hosts),
+            "added_host_count": len(added_hosts),
             "hosts": roots,
+            "added_hosts": added_hosts,
+            "settings": saved_settings,
             "devices": devices,
             "warnings": failures,
-            "message": f"Shelly discovery found {len(roots)} host{'s' if len(roots) != 1 else ''} and {len(devices)} resource{'s' if len(devices) != 1 else ''}.",
+            "message": (
+                f"Shelly discovery found {len(roots)} host{'s' if len(roots) != 1 else ''} "
+                f"and {len(devices)} resource{'s' if len(devices) != 1 else ''}."
+                f"{added_text}"
+            ),
         }
 
     roots = discover_shelly_roots(force=True)
