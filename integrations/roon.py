@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import contextlib
 import json
@@ -19,6 +19,7 @@ ROON_DEFAULT_ENABLED = True
 ROON_DEFAULT_CORE_PORT = 9330
 ROON_FALLBACK_CORE_PORTS = (9100,)
 ROON_DEFAULT_TIMEOUT_SECONDS = 10
+ROON_PAIRING_TIMEOUT_SECONDS = 120
 ROON_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3
 ROON_EXTENSION_ID = "com.taterassistant.roon"
 ROON_EXTENSION_NAME = "Tater Roon"
@@ -636,12 +637,13 @@ class RoonClient:
     def connect_and_register(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         core = self.info()
         token = _token_for_core(settings, core.get("core_id"))
+        register_timeout = max(float(self.timeout_s), float(ROON_PAIRING_TIMEOUT_SECONDS if not token else 30))
         try:
-            registration = self.register(token=token, timeout_s=max(15.0, self.timeout_s))
+            registration = self.register(token=token, timeout_s=register_timeout)
         except TimeoutError as exc:
             raise RoonPairingRequired(
-                "Roon found the Core, but Tater has not been enabled yet. Open Roon Settings > Setup > Extensions, "
-                "enable Tater Roon, then run Pair / Test Roon again."
+                "Roon found the Core, but Tater has not been enabled yet. Click Pair / Test Roon, then open "
+                "Roon Settings > Setup > Extensions and enable Tater Roon while Tater is still waiting."
             ) from exc
         if _text(registration.get("name")) != "Registered":
             raise RoonPairingRequired(
