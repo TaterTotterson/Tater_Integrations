@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import contextlib
 import html
@@ -558,6 +558,58 @@ def _sonos_audio_clip_player_id(speaker: Dict[str, Any]) -> str:
     )
 
 
+def _sonos_audio_clip_member_targets(speaker: Dict[str, Any]) -> List[Dict[str, Any]]:
+    row = speaker if isinstance(speaker, dict) else {}
+    kind = _text(row.get("sonos_target_kind")).lower()
+    if kind != "stereo_pair":
+        return [dict(row)]
+
+    member_rows = row.get("member_rows") if isinstance(row.get("member_rows"), list) else []
+    targets: List[Dict[str, Any]] = []
+    if member_rows:
+        for member in member_rows:
+            if not isinstance(member, dict):
+                continue
+            member_id = sonos_target_id(member.get("id") or member.get("udn"))
+            if not member_id:
+                continue
+            next_row = dict(row)
+            next_row["id"] = member_id
+            next_row["udn"] = _text(member.get("udn")) or f"uuid:{member_id}"
+            next_row["coordinator_id"] = ""
+            next_row["host"] = _text(member.get("host")) or _text(row.get("host"))
+            next_row["root_url"] = normalize_sonos_root(member.get("root_url")) or _text(row.get("root_url"))
+            targets.append(next_row)
+    else:
+        member_ids = row.get("member_ids") if isinstance(row.get("member_ids"), list) else []
+        member_hosts = row.get("member_hosts") if isinstance(row.get("member_hosts"), list) else []
+        member_roots = row.get("member_root_urls") if isinstance(row.get("member_root_urls"), list) else []
+        for index, raw_id in enumerate(member_ids):
+            member_id = sonos_target_id(raw_id)
+            if not member_id:
+                continue
+            next_row = dict(row)
+            next_row["id"] = member_id
+            next_row["udn"] = f"uuid:{member_id}"
+            next_row["coordinator_id"] = ""
+            next_row["host"] = _text(member_hosts[index] if index < len(member_hosts) else "") or _text(row.get("host"))
+            next_row["root_url"] = (
+                normalize_sonos_root(member_roots[index] if index < len(member_roots) else "")
+                or _text(row.get("root_url"))
+            )
+            targets.append(next_row)
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for target in targets or [dict(row)]:
+        player_id = _sonos_audio_clip_player_id(target)
+        if not player_id or player_id in seen:
+            continue
+        seen.add(player_id)
+        deduped.append(target)
+    return deduped or [dict(row)]
+
+
 def _sonos_websocket_command(
     host: str,
     command: Dict[str, Any],
@@ -627,6 +679,33 @@ def _sonos_play_audio_clip_sync(
     if isinstance(first, dict) and first.get("success") is True:
         return response
     raise RuntimeError(f"Sonos audio clip failed: {_text(first or response)[:200]}")
+
+
+def _sonos_play_audio_clip_targets_sync(
+    speaker: Dict[str, Any],
+    source_url: Any,
+    *,
+    timeout_s: float,
+    volume: Any = None,
+) -> List[Any]:
+    responses: List[Any] = []
+    failures: List[str] = []
+    for target in _sonos_audio_clip_member_targets(speaker):
+        player_id = _sonos_audio_clip_player_id(target)
+        try:
+            responses.extend(
+                _sonos_play_audio_clip_sync(
+                    target,
+                    source_url,
+                    timeout_s=timeout_s,
+                    volume=volume,
+                )
+            )
+        except Exception as exc:
+            failures.append(f"{player_id or 'unknown'} ({exc})")
+    if responses:
+        return responses
+    raise RuntimeError("; ".join(failures) or "Sonos audio clip failed.")
 
 
 def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: float) -> None:
@@ -974,6 +1053,17 @@ def _apply_sonos_topology(rows: List[Dict[str, str]], *, timeout_s: float) -> Li
             for member in set_members
             if normalize_sonos_root(member.get("root_url") or member.get("location"))
         ]
+        member_rows = [
+            {
+                "id": sonos_target_id(member.get("id") or member.get("udn")),
+                "udn": _text(member.get("udn")) or f"uuid:{sonos_target_id(member.get('id') or member.get('udn'))}",
+                "name": _text(member.get("name")),
+                "host": _text(member.get("host")),
+                "root_url": normalize_sonos_root(member.get("root_url") or member.get("location")),
+            }
+            for member in set_members
+            if sonos_target_id(member.get("id") or member.get("udn"))
+        ]
 
         target.update(
             {
@@ -986,6 +1076,7 @@ def _apply_sonos_topology(rows: List[Dict[str, str]], *, timeout_s: float) -> Li
                 "member_names": member_names,
                 "member_hosts": member_hosts,
                 "member_root_urls": member_roots,
+                "member_rows": member_rows,
                 "aliases": [*member_ids, *member_hosts, *member_roots],
                 "coordinator_id": coordinator_id,
                 "zone_group_id": _text(group.get("id")),
@@ -1110,7 +1201,7 @@ def sonos_play_url_sync(
     with contextlib.suppress(Exception):
         state = _sonos_current_transport_state(root_url, timeout_s=min(5.0, timeout_s))
     try:
-        _sonos_play_audio_clip_sync(speaker, url, timeout_s=timeout_s)
+        _sonos_play_audio_clip_targets_sync(speaker, url, timeout_s=timeout_s)
         return
     except Exception as exc:
         if state not in {"STOPPED", "NO_MEDIA_PRESENT"}:
