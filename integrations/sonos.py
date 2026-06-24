@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import contextlib
 import html
@@ -23,6 +23,7 @@ SONOS_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 2
 SONOS_DISCOVERY_CACHE_KEY = "tater:sonos:speakers:registry:v1"
 SONOS_DISCOVERY_CACHE_TTL_SECONDS = 60.0
 SONOS_AVTRANSPORT_SERVICE = "urn:schemas-upnp-org:service:AVTransport:1"
+SONOS_RENDERING_CONTROL_SERVICE = "urn:schemas-upnp-org:service:RenderingControl:1"
 SONOS_ZONE_GROUP_TOPOLOGY_SERVICE = "urn:schemas-upnp-org:service:ZoneGroupTopology:1"
 SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS = 30.0
 
@@ -398,6 +399,179 @@ def _sonos_soap_action(
     if response.status_code >= 400:
         raise RuntimeError(f"Sonos {action} HTTP {response.status_code}: {_text(response.text)[:200]}")
     return _text(response.text)
+
+
+def _sonos_response_values(response_xml: Any) -> Dict[str, str]:
+    payload = _text(response_xml)
+    if not payload:
+        return {}
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return {}
+    values: Dict[str, str] = {}
+    for node in root.iter():
+        name = _xml_local_name(node.tag)
+        if not name or name in {"Envelope", "Body"} or name.endswith("Response"):
+            continue
+        text = _text(node.text)
+        if text:
+            values[name] = text
+    return values
+
+
+def _sonos_av_transport_values(root_url: str, *, action: str, timeout_s: float) -> Dict[str, str]:
+    body = _sonos_soap_action(
+        root_url,
+        action=action,
+        inner_xml="<InstanceID>0</InstanceID>",
+        timeout_s=timeout_s,
+    )
+    return _sonos_response_values(body)
+
+
+def _sonos_get_volume(root_url: str, *, timeout_s: float) -> Optional[int]:
+    body = _sonos_soap_action(
+        root_url,
+        action="GetVolume",
+        inner_xml="<InstanceID>0</InstanceID><Channel>Master</Channel>",
+        timeout_s=timeout_s,
+        service=SONOS_RENDERING_CONTROL_SERVICE,
+        control_path="/MediaRenderer/RenderingControl/Control",
+    )
+    values = _sonos_response_values(body)
+    try:
+        return int(values.get("CurrentVolume") or "")
+    except Exception:
+        return None
+
+
+def _sonos_set_volume(root_url: str, volume: Any, *, timeout_s: float) -> None:
+    try:
+        level = max(0, min(100, int(float(_text(volume)))))
+    except Exception:
+        return
+    _sonos_soap_action(
+        root_url,
+        action="SetVolume",
+        inner_xml=f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>",
+        timeout_s=timeout_s,
+        service=SONOS_RENDERING_CONTROL_SERVICE,
+        control_path="/MediaRenderer/RenderingControl/Control",
+    )
+
+
+def _sonos_snapshot_player(root_url: str, *, timeout_s: float) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        snapshot["transport"] = _sonos_av_transport_values(root_url, action="GetTransportInfo", timeout_s=timeout_s)
+    with contextlib.suppress(Exception):
+        snapshot["media"] = _sonos_av_transport_values(root_url, action="GetMediaInfo", timeout_s=timeout_s)
+    with contextlib.suppress(Exception):
+        snapshot["position"] = _sonos_av_transport_values(root_url, action="GetPositionInfo", timeout_s=timeout_s)
+    with contextlib.suppress(Exception):
+        snapshot["volume"] = _sonos_get_volume(root_url, timeout_s=timeout_s)
+    return snapshot
+
+
+def _sonos_transport_state(snapshot: Dict[str, Any]) -> str:
+    transport = snapshot.get("transport") if isinstance(snapshot.get("transport"), dict) else {}
+    return _text(transport.get("CurrentTransportState")).upper()
+
+
+def _sonos_snapshot_uri(snapshot: Dict[str, Any]) -> str:
+    media = snapshot.get("media") if isinstance(snapshot.get("media"), dict) else {}
+    position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+    return _text(media.get("CurrentURI")) or _text(position.get("TrackURI"))
+
+
+def _sonos_snapshot_metadata(snapshot: Dict[str, Any]) -> str:
+    media = snapshot.get("media") if isinstance(snapshot.get("media"), dict) else {}
+    position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+    return _text(media.get("CurrentURIMetaData")) or _text(position.get("TrackMetaData"))
+
+
+def _sonos_seek(root_url: str, rel_time: Any, *, timeout_s: float) -> None:
+    target = _text(rel_time)
+    if not target or target in {"0:00:00", "00:00:00", "NOT_IMPLEMENTED"}:
+        return
+    _sonos_soap_action(
+        root_url,
+        action="Seek",
+        inner_xml=f"<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{xml_escape(target)}</Target>",
+        timeout_s=timeout_s,
+    )
+
+
+def _sonos_play(root_url: str, *, timeout_s: float) -> None:
+    _sonos_soap_action(
+        root_url,
+        action="Play",
+        inner_xml="<InstanceID>0</InstanceID><Speed>1</Speed>",
+        timeout_s=timeout_s,
+    )
+
+
+def _sonos_pause(root_url: str, *, timeout_s: float) -> None:
+    _sonos_soap_action(root_url, action="Pause", inner_xml="<InstanceID>0</InstanceID>", timeout_s=timeout_s)
+
+
+def _sonos_stop(root_url: str, *, timeout_s: float) -> None:
+    _sonos_soap_action(root_url, action="Stop", inner_xml="<InstanceID>0</InstanceID>", timeout_s=timeout_s)
+
+
+def _sonos_wait_for_playback_end(root_url: str, *, timeout_s: float) -> None:
+    deadline = time.monotonic() + max(1.0, float(timeout_s or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS))
+    saw_playing = False
+    while time.monotonic() < deadline:
+        with contextlib.suppress(Exception):
+            values = _sonos_av_transport_values(root_url, action="GetTransportInfo", timeout_s=min(3.0, timeout_s))
+            state = _text(values.get("CurrentTransportState")).upper()
+            if state == "PLAYING":
+                saw_playing = True
+            elif saw_playing and state not in {"TRANSITIONING"}:
+                return
+        time.sleep(0.25)
+
+
+def _sonos_restore_player(root_url: str, snapshot: Dict[str, Any], *, timeout_s: float) -> None:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return
+    uri = _sonos_snapshot_uri(snapshot)
+    metadata = _sonos_snapshot_metadata(snapshot)
+    state = _sonos_transport_state(snapshot)
+    if uri:
+        escaped_uri = xml_escape(uri, {'"': "&quot;"})
+        escaped_metadata = xml_escape(metadata, {'"': "&quot;"})
+        _sonos_soap_action(
+            root_url,
+            action="SetAVTransportURI",
+            inner_xml=(
+                "<InstanceID>0</InstanceID>"
+                f"<CurrentURI>{escaped_uri}</CurrentURI>"
+                f"<CurrentURIMetaData>{escaped_metadata}</CurrentURIMetaData>"
+            ),
+            timeout_s=timeout_s,
+        )
+        position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+        with contextlib.suppress(Exception):
+            _sonos_seek(root_url, position.get("RelTime"), timeout_s=timeout_s)
+
+    volume = snapshot.get("volume")
+    if volume is not None:
+        with contextlib.suppress(Exception):
+            _sonos_set_volume(root_url, volume, timeout_s=timeout_s)
+
+    if state == "PLAYING":
+        with contextlib.suppress(Exception):
+            _sonos_play(root_url, timeout_s=timeout_s)
+    elif state == "PAUSED_PLAYBACK":
+        with contextlib.suppress(Exception):
+            _sonos_play(root_url, timeout_s=timeout_s)
+            _sonos_pause(root_url, timeout_s=timeout_s)
+    elif state == "STOPPED":
+        with contextlib.suppress(Exception):
+            _sonos_stop(root_url, timeout_s=timeout_s)
 
 
 def _zone_group_state_xml(root_url: str, *, timeout_s: float) -> str:
@@ -793,6 +967,8 @@ def sonos_play_url_sync(
     speaker: Dict[str, Any],
     source_url: Any,
     timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
+    restore_after: bool = True,
+    restore_wait_s: Optional[float] = None,
 ) -> None:
     root_url = _text(speaker.get("root_url")) if isinstance(speaker, dict) else ""
     url = _text(source_url)
@@ -800,23 +976,26 @@ def sonos_play_url_sync(
         raise RuntimeError("Sonos speaker root URL is missing.")
     if not url:
         raise RuntimeError("Sonos source URL is missing.")
+    snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
     escaped_url = xml_escape(url, {'"': "&quot;"})
-    _sonos_soap_action(
-        root_url,
-        action="SetAVTransportURI",
-        inner_xml=(
-            "<InstanceID>0</InstanceID>"
-            f"<CurrentURI>{escaped_url}</CurrentURI>"
-            "<CurrentURIMetaData></CurrentURIMetaData>"
-        ),
-        timeout_s=timeout_s,
-    )
-    _sonos_soap_action(
-        root_url,
-        action="Play",
-        inner_xml="<InstanceID>0</InstanceID><Speed>1</Speed>",
-        timeout_s=timeout_s,
-    )
+    try:
+        _sonos_soap_action(
+            root_url,
+            action="SetAVTransportURI",
+            inner_xml=(
+                "<InstanceID>0</InstanceID>"
+                f"<CurrentURI>{escaped_url}</CurrentURI>"
+                "<CurrentURIMetaData></CurrentURIMetaData>"
+            ),
+            timeout_s=timeout_s,
+        )
+        _sonos_play(root_url, timeout_s=timeout_s)
+        if restore_after:
+            _sonos_wait_for_playback_end(root_url, timeout_s=restore_wait_s or timeout_s)
+    finally:
+        if restore_after and snapshot:
+            with contextlib.suppress(Exception):
+                _sonos_restore_player(root_url, snapshot, timeout_s=timeout_s)
 
 
 def sonos_play_media_sync(
@@ -824,6 +1003,8 @@ def sonos_play_media_sync(
     speakers: List[str],
     source_url: Any,
     timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
+    restore_after: bool = True,
+    restore_wait_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     clean_speakers = [sonos_target_id(item) for item in list(speakers or []) if sonos_target_id(item)]
     if not clean_speakers:
@@ -834,15 +1015,41 @@ def sonos_play_media_sync(
 
     sent_count = 0
     failures: List[str] = []
-    for target in clean_speakers:
-        try:
-            speaker = resolve_sonos_target(target)
-            if not speaker:
-                raise RuntimeError("speaker was not found")
-            sonos_play_url_sync(speaker=speaker, source_url=url, timeout_s=timeout_s)
-            sent_count += 1
-        except Exception as exc:
-            failures.append(f"{target} ({exc})")
+    restore_rows: List[Dict[str, Any]] = []
+    try:
+        for target in clean_speakers:
+            try:
+                speaker = resolve_sonos_target(target)
+                if not speaker:
+                    raise RuntimeError("speaker was not found")
+                root_url = _text(speaker.get("root_url")) if isinstance(speaker, dict) else ""
+                if not root_url:
+                    raise RuntimeError("Sonos speaker root URL is missing.")
+                snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
+                if restore_after and snapshot:
+                    restore_rows.append({"target": target, "root_url": root_url, "snapshot": snapshot})
+                sonos_play_url_sync(
+                    speaker=speaker,
+                    source_url=url,
+                    timeout_s=timeout_s,
+                    restore_after=False,
+                )
+                sent_count += 1
+            except Exception as exc:
+                failures.append(f"{target} ({exc})")
+    finally:
+        if restore_after and restore_rows:
+            first_root = _text(restore_rows[0].get("root_url"))
+            if first_root:
+                with contextlib.suppress(Exception):
+                    _sonos_wait_for_playback_end(first_root, timeout_s=restore_wait_s or timeout_s)
+            for row in restore_rows:
+                with contextlib.suppress(Exception):
+                    _sonos_restore_player(
+                        _text(row.get("root_url")),
+                        row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {},
+                        timeout_s=timeout_s,
+                    )
 
     if sent_count:
         result: Dict[str, Any] = {"ok": True, "sent_count": sent_count}
