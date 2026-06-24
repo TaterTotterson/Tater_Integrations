@@ -1,10 +1,11 @@
 from __future__ import annotations
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import contextlib
 import html
 import json
 import socket
+import ssl
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +17,11 @@ import requests
 
 from helpers import redis_client
 
+try:
+    import websocket
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    websocket = None
+
 SONOS_SETTINGS_KEY = "sonos_settings"
 SONOS_TARGET_PREFIX = "sonos:"
 SONOS_DEFAULT_ENABLED = True
@@ -26,6 +32,10 @@ SONOS_AVTRANSPORT_SERVICE = "urn:schemas-upnp-org:service:AVTransport:1"
 SONOS_RENDERING_CONTROL_SERVICE = "urn:schemas-upnp-org:service:RenderingControl:1"
 SONOS_ZONE_GROUP_TOPOLOGY_SERVICE = "urn:schemas-upnp-org:service:ZoneGroupTopology:1"
 SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS = 30.0
+SONOS_AUDIOCLIP_API_KEY = "123e4567-e89b-12d3-a456-426655440000"
+SONOS_AUDIOCLIP_SUBPROTOCOL = "v1.api.smartspeaker.audio"
+SONOS_AUDIOCLIP_APP_ID = "com.tatertotterson.tater"
+SONOS_AUDIOCLIP_NAME = "Tater Announcement"
 
 INTEGRATION = {
     "id": "sonos",
@@ -520,6 +530,125 @@ def _sonos_stop(root_url: str, *, timeout_s: float) -> None:
     _sonos_soap_action(root_url, action="Stop", inner_xml="<InstanceID>0</InstanceID>", timeout_s=timeout_s)
 
 
+def _sonos_current_transport_state(root_url: str, *, timeout_s: float) -> str:
+    values = _sonos_av_transport_values(root_url, action="GetTransportInfo", timeout_s=timeout_s)
+    return _text(values.get("CurrentTransportState")).upper()
+
+
+def _sonos_host_from_value(value: Any) -> str:
+    token = _text(value)
+    if not token:
+        return ""
+    parsed = urlparse(token)
+    if parsed.hostname:
+        return parsed.hostname
+    parsed = urlparse(f"//{token}")
+    return _text(parsed.hostname or token.split(":", 1)[0])
+
+
+def _sonos_audio_clip_host(speaker: Dict[str, Any]) -> str:
+    return _sonos_host_from_value(speaker.get("host")) or _sonos_host_from_value(speaker.get("root_url"))
+
+
+def _sonos_audio_clip_player_id(speaker: Dict[str, Any]) -> str:
+    return (
+        sonos_target_id(speaker.get("coordinator_id"))
+        or sonos_target_id(speaker.get("id"))
+        or sonos_target_id(speaker.get("udn"))
+    )
+
+
+def _sonos_websocket_command(
+    host: str,
+    command: Dict[str, Any],
+    options: Dict[str, Any],
+    *,
+    timeout_s: float,
+) -> List[Any]:
+    if websocket is None:
+        raise RuntimeError("websocket-client is not installed.")
+    if not host:
+        raise RuntimeError("Sonos speaker host is missing.")
+
+    connection = websocket.create_connection(
+        f"wss://{host}:1443/websocket/api",
+        timeout=max(2.0, min(10.0, float(timeout_s or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS))),
+        sslopt={"cert_reqs": ssl.CERT_NONE, "check_hostname": False},
+        header=[f"X-Sonos-Api-Key: {SONOS_AUDIOCLIP_API_KEY}"],
+        subprotocols=[SONOS_AUDIOCLIP_SUBPROTOCOL],
+    )
+    try:
+        connection.send(json.dumps([command, options]))
+        raw_response = connection.recv()
+    finally:
+        with contextlib.suppress(Exception):
+            connection.close()
+
+    try:
+        response = json.loads(_text(raw_response))
+    except Exception as exc:
+        raise RuntimeError(f"Sonos audio clip returned an invalid response: {_text(raw_response)[:200]}") from exc
+    if isinstance(response, list):
+        return response
+    return [response]
+
+
+def _sonos_play_audio_clip_sync(
+    speaker: Dict[str, Any],
+    source_url: Any,
+    *,
+    timeout_s: float,
+    volume: Any = None,
+) -> List[Any]:
+    url = _text(source_url)
+    if not url:
+        raise RuntimeError("Sonos source URL is missing.")
+    host = _sonos_audio_clip_host(speaker)
+    player_id = _sonos_audio_clip_player_id(speaker)
+    if not player_id:
+        raise RuntimeError("Sonos player id is missing.")
+
+    command = {
+        "namespace": "audioClip:1",
+        "command": "loadAudioClip",
+        "playerId": player_id,
+    }
+    options: Dict[str, Any] = {
+        "name": SONOS_AUDIOCLIP_NAME,
+        "appId": SONOS_AUDIOCLIP_APP_ID,
+        "streamUrl": url,
+    }
+    if volume is not None:
+        with contextlib.suppress(Exception):
+            options["volume"] = max(0, min(100, int(float(_text(volume)))))
+
+    response = _sonos_websocket_command(host, command, options, timeout_s=timeout_s)
+    first = response[0] if response else {}
+    if isinstance(first, dict) and first.get("success") is True:
+        return response
+    raise RuntimeError(f"Sonos audio clip failed: {_text(first or response)[:200]}")
+
+
+def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: float) -> None:
+    url = _text(source_url)
+    if not root_url:
+        raise RuntimeError("Sonos speaker root URL is missing.")
+    if not url:
+        raise RuntimeError("Sonos source URL is missing.")
+    escaped_url = xml_escape(url, {'"': "&quot;"})
+    _sonos_soap_action(
+        root_url,
+        action="SetAVTransportURI",
+        inner_xml=(
+            "<InstanceID>0</InstanceID>"
+            f"<CurrentURI>{escaped_url}</CurrentURI>"
+            "<CurrentURIMetaData></CurrentURIMetaData>"
+        ),
+        timeout_s=timeout_s,
+    )
+    _sonos_play(root_url, timeout_s=timeout_s)
+
+
 def _sonos_wait_for_playback_end(root_url: str, *, timeout_s: float) -> None:
     deadline = time.monotonic() + max(1.0, float(timeout_s or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS))
     saw_playing = False
@@ -976,26 +1105,20 @@ def sonos_play_url_sync(
         raise RuntimeError("Sonos speaker root URL is missing.")
     if not url:
         raise RuntimeError("Sonos source URL is missing.")
-    snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
-    escaped_url = xml_escape(url, {'"': "&quot;"})
+
+    state = ""
+    with contextlib.suppress(Exception):
+        state = _sonos_current_transport_state(root_url, timeout_s=min(5.0, timeout_s))
     try:
-        _sonos_soap_action(
-            root_url,
-            action="SetAVTransportURI",
-            inner_xml=(
-                "<InstanceID>0</InstanceID>"
-                f"<CurrentURI>{escaped_url}</CurrentURI>"
-                "<CurrentURIMetaData></CurrentURIMetaData>"
-            ),
-            timeout_s=timeout_s,
-        )
-        _sonos_play(root_url, timeout_s=timeout_s)
-        if restore_after:
-            _sonos_wait_for_playback_end(root_url, timeout_s=restore_wait_s or timeout_s)
-    finally:
-        if restore_after and snapshot:
-            with contextlib.suppress(Exception):
-                _sonos_restore_player(root_url, snapshot, timeout_s=timeout_s)
+        _sonos_play_audio_clip_sync(speaker, url, timeout_s=timeout_s)
+        return
+    except Exception as exc:
+        if state not in {"STOPPED", "NO_MEDIA_PRESENT"}:
+            raise RuntimeError(
+                "Sonos audio clip failed while the speaker was playing or its state was unknown; "
+                "refused to replace Sonos playback."
+            ) from exc
+        _sonos_replace_transport_uri(root_url, url, timeout_s=timeout_s)
 
 
 def sonos_play_media_sync(
@@ -1015,41 +1138,21 @@ def sonos_play_media_sync(
 
     sent_count = 0
     failures: List[str] = []
-    restore_rows: List[Dict[str, Any]] = []
-    try:
-        for target in clean_speakers:
-            try:
-                speaker = resolve_sonos_target(target)
-                if not speaker:
-                    raise RuntimeError("speaker was not found")
-                root_url = _text(speaker.get("root_url")) if isinstance(speaker, dict) else ""
-                if not root_url:
-                    raise RuntimeError("Sonos speaker root URL is missing.")
-                snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
-                if restore_after and snapshot:
-                    restore_rows.append({"target": target, "root_url": root_url, "snapshot": snapshot})
-                sonos_play_url_sync(
-                    speaker=speaker,
-                    source_url=url,
-                    timeout_s=timeout_s,
-                    restore_after=False,
-                )
-                sent_count += 1
-            except Exception as exc:
-                failures.append(f"{target} ({exc})")
-    finally:
-        if restore_after and restore_rows:
-            first_root = _text(restore_rows[0].get("root_url"))
-            if first_root:
-                with contextlib.suppress(Exception):
-                    _sonos_wait_for_playback_end(first_root, timeout_s=restore_wait_s or timeout_s)
-            for row in restore_rows:
-                with contextlib.suppress(Exception):
-                    _sonos_restore_player(
-                        _text(row.get("root_url")),
-                        row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {},
-                        timeout_s=timeout_s,
-                    )
+    for target in clean_speakers:
+        try:
+            speaker = resolve_sonos_target(target)
+            if not speaker:
+                raise RuntimeError("speaker was not found")
+            sonos_play_url_sync(
+                speaker=speaker,
+                source_url=url,
+                timeout_s=timeout_s,
+                restore_after=restore_after,
+                restore_wait_s=restore_wait_s,
+            )
+            sent_count += 1
+        except Exception as exc:
+            failures.append(f"{target} ({exc})")
 
     if sent_count:
         result: Dict[str, Any] = {"ok": True, "sent_count": sent_count}

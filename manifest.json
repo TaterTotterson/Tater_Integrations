@@ -111,9 +111,9 @@
       "id": "sonos",
       "name": "Sonos",
       "description": "Sonos speaker discovery and direct playback targets for announcements.",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "entry": "integrations/sonos.py",
-      "sha256": "9b3d031c09e3d26490ca32cf3c17acb6a2b8b2d0a134d6d0ba618c32bc6eb056",
+      "sha256": "6a478c71fcf7f3a0cb3ee80612539bc96ab9298a6595619e869a3892af393122",
       "required": false
     },
     {
