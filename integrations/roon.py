@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 import contextlib
 import json
@@ -608,9 +608,7 @@ class RoonClient:
             if _text(message.get("request_id")) != str(request_id):
                 continue
             verb = _text(message.get("verb"))
-            if verb == "COMPLETE":
-                return message
-            if verb == "CONTINUE" and _text(message.get("name")) == "Registered":
+            if verb in {"COMPLETE", "CONTINUE"}:
                 return message
 
     def register(self, *, token: Any = None, timeout_s: Any = None) -> Dict[str, Any]:
