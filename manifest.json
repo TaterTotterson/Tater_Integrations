@@ -7,10 +7,11 @@
       "id": "aladdin",
       "name": "Aladdin Connect",
       "description": "Direct Genie/Aladdin garage door login used by Tater garage door actions.",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "entry": "integrations/aladdin.py",
-      "sha256": "5480e9e03bafed033e6202c9cefdeac42901f7e2e69bc3b7fc1a52d198506802",
-      "required": false
+      "sha256": "1f65bf300346533845999a87439b33d899bd92427024a9fd962cb5c4d6281d4d",
+      "required": false,
+      "capabilities": ["garage_door", "cover", "entry_sensor", "battery"]
     },
     {
       "id": "brave_search",
@@ -40,28 +41,31 @@
       "id": "homeassistant",
       "name": "Home Assistant",
       "description": "Shared Home Assistant endpoint and token for portals, verbas, and announcement paths.",
-      "version": "1.1.0",
+      "version": "1.3.1",
       "entry": "integrations/homeassistant.py",
-      "sha256": "664ef0e43bcb5148bfdcedef8a34b5be7c7ea087f2da700fd7d938a94920f513",
-      "required": false
+      "sha256": "fdfa1c6f6fc7d7d56c635781fa46c6cdec604bfb8c6ec7b99abe05bbc027b5c5",
+      "required": false,
+      "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "cover", "climate", "media_player", "remote", "scene", "script"]
     },
     {
       "id": "homekit",
       "name": "Ecobee (HomeKit)",
-      "description": "Pair an Ecobee thermostat directly through HomeKit using the setup code.",
-      "version": "1.1.0",
+      "description": "Pair an Ecobee thermostat and environment sensors directly through HomeKit.",
+      "version": "1.2.0",
       "entry": "integrations/homekit.py",
-      "sha256": "ac07a4c848c02db58533294d7a531477d1df031bd1a19e62004fb66179c795f3",
-      "required": false
+      "sha256": "61de804d66454ef6c93daad4fddab5ab6817fc39405d2efa24ef02739baa9651",
+      "required": false,
+      "capabilities": ["climate", "temperature", "humidity", "motion", "entry_sensor", "battery", "sensor"]
     },
     {
       "id": "hue",
       "name": "Philips Hue",
       "description": "Hue Bridge pairing and app key used by Tater lighting actions.",
-      "version": "1.1.0",
+      "version": "1.3.3",
       "entry": "integrations/hue.py",
-      "sha256": "4dae26a0ea8f75c08e882c783a76a692220b00b57e83792eb56c0ca194846c91",
-      "required": false
+      "sha256": "7983bd7e19ab6ff3d6fa74473d2bdcd76152cc8318f873793da55f90f9ad1f7c",
+      "required": false,
+      "capabilities": ["light", "switch", "sensor", "entry_sensor", "motion", "temperature", "humidity", "illuminance", "battery"]
     },
     {
       "id": "huggingface",
@@ -100,30 +104,33 @@
       "id": "shelly",
       "name": "Shelly",
       "description": "Local Shelly device discovery and direct HTTP control for switches, lights, covers, and sensors.",
-      "version": "1.1.0",
+      "version": "1.2.1",
       "entry": "integrations/shelly.py",
-      "sha256": "b50563bcf03a9328e625eba2920945ef0b46bc81fe689e5cf182ab5981009ca3",
+      "sha256": "63b23b471ebce33eb6ea296c2596e25fffe2300c6deeb5674998f4581288be4c",
       "required": false,
+      "capabilities": ["light", "switch", "plug", "cover", "sensor", "temperature", "humidity", "illuminance", "energy"],
       "redis_hashes": ["shelly_settings"],
       "redis_strings": ["tater:shelly:devices:registry:v1"]
     },
     {
       "id": "sonos",
       "name": "Sonos",
-      "description": "Sonos speaker discovery and direct playback targets for announcements.",
-      "version": "1.1.3",
+      "description": "Sonos speaker discovery and direct playback targets for announcements and music.",
+      "version": "1.2.4",
       "entry": "integrations/sonos.py",
-      "sha256": "2baa3b23c04634df143015774fb37f7967390b52e5d953ce06addcd0a0da4dfb",
-      "required": false
+      "sha256": "2b713ca4c0982566678cf022565545246e35459bedb9e7b4b510004f1a554c9a",
+      "required": false,
+      "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"]
     },
     {
       "id": "roon",
       "name": "Roon",
       "description": "Roon Core pairing, zone transport controls, and library browse playback targets.",
-      "version": "1.1.5",
+      "version": "1.2.1",
       "entry": "integrations/roon.py",
-      "sha256": "d733b16bd079de97af2a8a1e9635e63f92ba39593f9868ce1d7279faa7fa4404",
+      "sha256": "f68a69d4e952c5e2ad39bf6a3d165e36c3b04310ba2505215964c284b33067ea",
       "required": false,
+      "capabilities": ["speaker", "media_player", "audio_output", "music"],
       "redis_hashes": ["roon_settings"],
       "redis_strings": ["tater:roon:zones:registry:v1"]
     },
@@ -131,19 +138,21 @@
       "id": "unifi_network",
       "name": "UniFi Network",
       "description": "UniFi Network API key for client and device inventory actions.",
-      "version": "1.1.0",
+      "version": "1.2.3",
       "entry": "integrations/unifi_network.py",
-      "sha256": "5e0ba7071d58f47ee5279902d7ef5f6e9c606432200e859d5348a722a61f887d",
-      "required": false
+      "sha256": "3a611638c8204f05d7cc10bc0d8269882a011e610e5d13d428628dec32a76cd1",
+      "required": false,
+      "capabilities": ["network_device"]
     },
     {
       "id": "unifi_protect",
       "name": "UniFi Protect",
       "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
-      "version": "1.2.2",
+      "version": "1.3.1",
       "entry": "integrations/unifi_protect.py",
-      "sha256": "fecbe4a7099525b5cf5e517f7656e093bb196f2a60451ab7a027290066dc3274",
-      "required": false
+      "sha256": "44d5ad9e52852be2c320d0824631a53a49322ec2004e0ba310c2d09c731d299a",
+      "required": false,
+      "capabilities": ["camera", "motion", "entry_sensor", "temperature", "humidity", "illuminance", "leak", "battery", "speaker"]
     },
     {
       "id": "weather_api",

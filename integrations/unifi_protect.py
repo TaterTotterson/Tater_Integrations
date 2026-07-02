@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.2.2"
+__version__ = "1.3.1"
 
 import base64
 import contextlib
@@ -49,6 +49,17 @@ INTEGRATION = {
     "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
     "badge": "PRO",
     "order": 70,
+    "capabilities": [
+        "camera",
+        "motion",
+        "entry_sensor",
+        "temperature",
+        "humidity",
+        "illuminance",
+        "leak",
+        "battery",
+        "speaker",
+    ],
     "fields": [
         {
             "key": "unifi_protect_base_url",
@@ -314,6 +325,26 @@ def _first_text(row: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _protect_room(row: Dict[str, Any], fallback: Any = "") -> str:
+    return (
+        _first_text(
+            row,
+            "room",
+            "roomName",
+            "room_name",
+            "area",
+            "areaName",
+            "area_name",
+            "location",
+            "mountLocation",
+            "mount_location",
+            "siteName",
+            "site_name",
+        )
+        or _text(fallback)
+    )
+
+
 def _protect_bool_status(row: Dict[str, Any]) -> str:
     for key in ("isConnected", "is_connected", "connected", "isOnline", "is_online"):
         if key in row:
@@ -448,7 +479,7 @@ def _unifi_camera_capabilities(row: Dict[str, Any]) -> List[str]:
     if _unifi_camera_is_doorbell(row):
         caps.append("doorbell")
     if unifi_camera_has_speaker_hint(row):
-        caps.append("speaker")
+        caps.extend(["speaker", "media_player", "audio_output", "announcement_target"])
     return caps
 
 
@@ -491,8 +522,6 @@ def _unifi_sensor_kind(row: Dict[str, Any]) -> str:
     sensor_type = _text(row.get("sensorType") or row.get("sensor_type") or row.get("type")).lower()
     model = _text(row.get("model") or row.get("modelKey") or row.get("marketName")).lower()
     hint = f"{name} {mount_type} {sensor_type} {model}"
-    if "garage" in hint:
-        return "garage"
     if "window" in hint:
         return "window"
     if any(token in hint for token in ("door", "contact", "open")):
@@ -509,9 +538,9 @@ def _unifi_sensor_kind(row: Dict[str, Any]) -> str:
 def _unifi_sensor_capabilities(row: Dict[str, Any]) -> List[str]:
     caps = ["sensor"]
     sensor_kind = _unifi_sensor_kind(row)
-    if sensor_kind in {"door", "window", "garage", "contact"}:
+    if sensor_kind in {"door", "window", "contact"}:
         caps.extend(["entry_sensor", "contact", "open_close"])
-        if sensor_kind in {"door", "window", "garage"}:
+        if sensor_kind in {"door", "window"}:
             caps.append(sensor_kind)
     text = " ".join(_text(row.get(key)).lower() for key in ("name", "type", "sensorType", "sensor_type", "model", "modelKey"))
     if "motion" in text or _sensor_bool(row, "isMotionDetected", "is_motion_detected") is not None:
@@ -554,10 +583,10 @@ def _unifi_sensor_state(row: Dict[str, Any]) -> str:
 
 def _unifi_sensor_event_sources(row: Dict[str, Any], ref: str, sensor_kind: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    if _sensor_bool(row, "isOpened", "is_opened", "isOpen", "is_open", "open", "opened", "contactState", "contact_state") is not None or sensor_kind in {"door", "window", "garage", "contact"}:
+    if _sensor_bool(row, "isOpened", "is_opened", "isOpen", "is_open", "open", "opened", "contactState", "contact_state") is not None or sensor_kind in {"door", "window", "contact"}:
         out.append(
             {
-                "type": sensor_kind if sensor_kind in {"door", "window", "garage"} else "contact",
+                "type": sensor_kind if sensor_kind in {"door", "window"} else "contact",
                 "ref": ref,
                 "state_on": "open",
                 "state_off": "closed",
@@ -638,7 +667,7 @@ def integration_runtime_poll(*, client: Any = None, cursor: Any = None) -> Dict[
         sensor_id = _first_text(row, "id", "_id", "uuid")
         name = _first_text(row, "name", "displayName", "friendlyName") or sensor_id
         sensor_kind = _unifi_sensor_kind(row)
-        if sensor_kind not in {"door", "window", "garage", "contact"}:
+        if sensor_kind not in {"door", "window", "contact"}:
             continue
         ref = _unifi_sensor_ref(sensor_id, name)
         if not ref:
@@ -689,6 +718,27 @@ def integration_devices() -> Dict[str, Any]:
         camera_id = _first_text(camera, "id", "_id", "uuid")
         name = unifi_camera_name(camera, camera_id)
         camera_entity = unifi_camera_entity(camera_id)
+        room = _protect_room(camera, name)
+        camera_details = _protect_details(
+            camera,
+            [
+                "model",
+                "modelKey",
+                "marketName",
+                "host",
+                "hostAddress",
+                "firmwareVersion",
+                "isConnected",
+                "isRecording",
+                "isMotionDetected",
+                "lastMotion",
+                "lastMotionAt",
+                "lastRing",
+                "lastRingAt",
+            ],
+        )
+        if room:
+            camera_details["room"] = room
         rows.append(
             {
                 "id": camera_id or name,
@@ -697,27 +747,17 @@ def integration_devices() -> Dict[str, Any]:
                 "ref": camera_entity or f"camera:{camera_id}",
                 "capabilities": _unifi_camera_capabilities(camera),
                 "actions": ["camera_snapshot"],
+                "features": [
+                    "snapshot",
+                    "motion",
+                    *(("speaker", "announcement") if unifi_camera_has_speaker_hint(camera) else ()),
+                ],
                 "event_sources": _unifi_camera_event_sources(camera_id, camera),
                 "status": _protect_bool_status(camera),
                 "state": _first_text(camera, "state", "status"),
-                "details": _protect_details(
-                    camera,
-                    [
-                        "model",
-                        "modelKey",
-                        "marketName",
-                        "host",
-                        "hostAddress",
-                        "firmwareVersion",
-                        "isConnected",
-                        "isRecording",
-                        "isMotionDetected",
-                        "lastMotion",
-                        "lastMotionAt",
-                        "lastRing",
-                        "lastRingAt",
-                    ],
-                ),
+                "room": room,
+                "area": room,
+                "details": camera_details,
             }
         )
     for sensor in sensors:
@@ -728,47 +768,55 @@ def integration_devices() -> Dict[str, Any]:
         sensor_kind = _unifi_sensor_kind(sensor)
         sensor_ref = f"binary_sensor.unifi_sensor_{_text(sensor_id).lower()}" if sensor_id else f"sensor:{name}"
         sensor_state = _unifi_sensor_state(sensor)
+        room = _protect_room(sensor, name)
+        sensor_capabilities = _unifi_sensor_capabilities(sensor)
+        sensor_details = _protect_details(
+            sensor,
+            [
+                "model",
+                "modelKey",
+                "marketName",
+                "type",
+                "sensorType",
+                "sensor_type",
+                "mountType",
+                "mount_type",
+                "batteryStatus",
+                "battery_status",
+                "batteryLevel",
+                "battery_level",
+                "isConnected",
+                "isOpened",
+                "is_opened",
+                "isMotionDetected",
+                "is_motion_detected",
+                "leakDetectedAt",
+                "leak_detected_at",
+                "alarmTriggeredAt",
+                "alarm_triggered_at",
+                "tamperingDetectedAt",
+                "tampering_detected_at",
+                "stats",
+                "lastSeen",
+                "last_seen",
+            ],
+        )
+        if room:
+            sensor_details["room"] = room
         rows.append(
             {
                 "id": sensor_id or name,
                 "name": name or "Sensor",
-                "type": "entry_sensor" if sensor_kind in {"door", "window", "garage", "contact"} else "sensor",
+                "type": "entry_sensor" if sensor_kind in {"door", "window", "contact"} else "sensor",
                 "ref": sensor_ref,
-                "capabilities": _unifi_sensor_capabilities(sensor),
+                "capabilities": sensor_capabilities,
+                "features": sensor_capabilities,
                 "event_sources": _unifi_sensor_event_sources(sensor, sensor_ref, sensor_kind),
                 "status": _protect_bool_status(sensor),
                 "state": sensor_state,
-                "details": _protect_details(
-                    sensor,
-                    [
-                        "model",
-                        "modelKey",
-                        "marketName",
-                        "type",
-                        "sensorType",
-                        "sensor_type",
-                        "mountType",
-                        "mount_type",
-                        "batteryStatus",
-                        "battery_status",
-                        "batteryLevel",
-                        "battery_level",
-                        "isConnected",
-                        "isOpened",
-                        "is_opened",
-                        "isMotionDetected",
-                        "is_motion_detected",
-                        "leakDetectedAt",
-                        "leak_detected_at",
-                        "alarmTriggeredAt",
-                        "alarm_triggered_at",
-                        "tamperingDetectedAt",
-                        "tampering_detected_at",
-                        "stats",
-                        "lastSeen",
-                        "last_seen",
-                    ],
-                ),
+                "room": room,
+                "area": room,
+                "details": sensor_details,
             }
         )
     result: Dict[str, Any] = {

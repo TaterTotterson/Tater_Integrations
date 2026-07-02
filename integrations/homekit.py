@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import asyncio
 import contextlib
@@ -89,9 +89,10 @@ HOMEKIT_CURRENT_MODE_NAMES = {
 INTEGRATION = {
     "id": "ecobee_homekit",
     "name": "Ecobee (HomeKit)",
-    "description": "Pair an Ecobee thermostat directly through HomeKit using the setup code.",
+    "description": "Pair an Ecobee thermostat and environment sensors directly through HomeKit.",
     "badge": "ECO",
     "order": 35,
+    "capabilities": ["climate", "temperature", "humidity", "motion", "entry_sensor", "battery", "sensor"],
     "fields": [
         {
             "key": "ecobee_homekit_alias",
@@ -1144,9 +1145,9 @@ def _homekit_sensor_capabilities(sensor_type: str) -> List[str]:
     if token == "motion":
         return ["sensor", "motion"]
     if token == "occupancy":
-        return ["sensor", "occupancy", "motion"]
+        return ["sensor", "occupancy", "motion", "presence"]
     if token == "contact":
-        return ["sensor", "contact", "entry_sensor"]
+        return ["sensor", "contact", "entry_sensor", "open_close"]
     return ["sensor"]
 
 
@@ -1176,6 +1177,7 @@ def integration_devices() -> Dict[str, Any]:
         state = f"{current_temp} F" if current_temp not in (None, "") else _text(row.get("current_hvac_state"))
         thermostat_id = _text(row.get("id")) or _text(row.get("name"))
         thermostat_ref = f"thermostat:{thermostat_id}" if thermostat_id else ""
+        room = _text(row.get("room") or row.get("location")) or alias.replace("_", " ").title()
         devices.append(
             {
                 "id": thermostat_id,
@@ -1184,10 +1186,14 @@ def integration_devices() -> Dict[str, Any]:
                 "ref": thermostat_ref,
                 "capabilities": ["thermostat", "climate", "hvac", "temperature", "humidity"],
                 "actions": ["set_temperature", "set_hvac_mode"],
+                "features": ["temperature", "humidity", "hvac_mode", "target_temperature"],
                 "status": _text(row.get("current_hvac_state")),
                 "state": state,
+                "room": room,
+                "area": room,
                 "details": {
                     "alias": alias,
+                    "room": room,
                     "current_temperature_f": row.get("current_temperature_f"),
                     "current_humidity": row.get("current_humidity"),
                     "target_temperature_f": row.get("target_temperature_f"),
@@ -1206,6 +1212,7 @@ def integration_devices() -> Dict[str, Any]:
         sensor_type = _text(row.get("type")) or "sensor"
         sensor_id = _text(row.get("id")) or _text(row.get("name"))
         sensor_ref = f"{sensor_type}:{sensor_id}" if sensor_id else ""
+        room = _text(row.get("room") or row.get("location")) or alias.replace("_", " ").title()
         if sensor_type == "temperature":
             state = f"{row.get('current_temperature_f')} F" if row.get("current_temperature_f") not in (None, "") else ""
         elif sensor_type == "humidity":
@@ -1223,11 +1230,15 @@ def integration_devices() -> Dict[str, Any]:
                 "type": sensor_type,
                 "ref": sensor_ref,
                 "capabilities": _homekit_sensor_capabilities(sensor_type),
+                "features": _homekit_sensor_capabilities(sensor_type),
                 "event_sources": _homekit_sensor_event_sources(sensor_type, sensor_ref),
                 "status": state,
                 "state": state,
+                "room": room,
+                "area": room,
                 "details": {
                     "alias": alias,
+                    "room": room,
                     "sensor_type": sensor_type,
                     "current_temperature_f": row.get("current_temperature_f"),
                     "current_humidity": row.get("current_humidity"),

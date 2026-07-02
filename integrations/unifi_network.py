@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.3"
 
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +22,7 @@ INTEGRATION = {
     "description": "UniFi Network API key for client and device inventory actions.",
     "badge": "NET",
     "order": 60,
+    "capabilities": ["network_device"],
     "fields": [
         {
             "key": "unifi_network_base_url",
@@ -235,36 +236,29 @@ def _dedupe(values: List[str]) -> List[str]:
 
 
 def _network_device_capabilities(row: Dict[str, Any]) -> List[str]:
-    raw_type = _first_text(row, "type", "deviceType", "device_type", "model").lower()
-    caps = ["network_device", "connectivity"]
-    if "gateway" in raw_type or raw_type in {"ugw", "udm", "usg"}:
-        caps.append("gateway")
-    if "switch" in raw_type or raw_type.startswith("usw"):
-        caps.append("switch")
-    if "access" in raw_type or "ap" in raw_type or raw_type.startswith("uap"):
-        caps.extend(["access_point", "wireless"])
-    return _dedupe(caps)
+    return ["network_device"]
 
 
 def _network_client_capabilities(row: Dict[str, Any]) -> List[str]:
-    caps = ["client", "presence", "connectivity"]
-    wired = row.get("wired")
-    if wired is True:
-        caps.append("wired")
-    elif wired is False:
-        caps.append("wireless")
-    elif _text(wired).lower() in {"true", "1", "yes", "wired"}:
-        caps.append("wired")
-    elif _text(wired).lower() in {"false", "0", "no", "wireless", "wifi"}:
-        caps.append("wireless")
-    return _dedupe(caps)
+    return ["network_device"]
+
+
+def _network_role(row: Dict[str, Any], default: str = "device") -> str:
+    raw_type = _first_text(row, "type", "deviceType", "device_type", "model").lower()
+    if "gateway" in raw_type or raw_type in {"ugw", "udm", "usg"}:
+        return "gateway"
+    if "switch" in raw_type or raw_type.startswith("usw"):
+        return "switch"
+    if "access" in raw_type or "ap" in raw_type or raw_type.startswith("uap"):
+        return "access_point"
+    return default
 
 
 def _network_event_sources(kind: str, ref: str) -> List[Dict[str, Any]]:
     if not ref:
         return []
     if kind == "client":
-        return [{"type": "presence", "ref": ref, "state_on": "connected", "state_off": "disconnected"}]
+        return [{"type": "connectivity", "ref": ref, "state_on": "connected", "state_off": "disconnected"}]
     return [{"type": "connectivity", "ref": ref, "state_on": "online", "state_off": "offline"}]
 
 
@@ -286,33 +280,38 @@ def integration_devices() -> Dict[str, Any]:
             continue
         device_id = _first_text(device, "id", "macAddress", "mac", "serial")
         name = _first_text(device, "name", "displayName", "model", "macAddress", "mac") or device_id
-        device_type = _first_text(device, "type", "model", "deviceType") or "network_device"
+        device_type = _first_text(device, "type", "model", "deviceType")
         device_ref = f"device:{device_id}" if device_id else ""
+        details = _details(
+            device,
+            [
+                "ipAddress",
+                "ip",
+                "macAddress",
+                "mac",
+                "model",
+                "version",
+                "firmwareVersion",
+                "adopted",
+                "uptime",
+            ],
+        )
+        details["network_role"] = _network_role(device, "device")
+        if device_type:
+            details["raw_type"] = device_type
         rows.append(
             {
                 "id": device_id or name,
                 "name": name or "Network Device",
-                "type": device_type,
+                "type": "network_device",
                 "ref": device_ref,
                 "capabilities": _network_device_capabilities(device),
                 "event_sources": _network_event_sources("device", device_ref),
                 "status": _network_status(device),
                 "state": _network_status(device),
+                "room": site_name,
                 "area": site_name,
-                "details": _details(
-                    device,
-                    [
-                        "ipAddress",
-                        "ip",
-                        "macAddress",
-                        "mac",
-                        "model",
-                        "version",
-                        "firmwareVersion",
-                        "adopted",
-                        "uptime",
-                    ],
-                ),
+                "details": details,
             }
         )
 
@@ -322,34 +321,37 @@ def integration_devices() -> Dict[str, Any]:
         client_id = _first_text(client, "id", "macAddress", "mac")
         name = _first_text(client, "name", "hostname", "displayName", "ipAddress", "ip", "macAddress", "mac") or client_id
         client_ref = f"client:{client_id}" if client_id else ""
+        details = _details(
+            client,
+            [
+                "ipAddress",
+                "ip",
+                "macAddress",
+                "mac",
+                "network",
+                "wired",
+                "wifiExperience",
+                "signal",
+                "rxRate",
+                "txRate",
+                "uplinkDeviceName",
+                "lastSeen",
+            ],
+        )
+        details["network_role"] = "client"
         rows.append(
             {
                 "id": client_id or name,
                 "name": name or "Client",
-                "type": "client",
+                "type": "network_device",
                 "ref": client_ref,
                 "capabilities": _network_client_capabilities(client),
                 "event_sources": _network_event_sources("client", client_ref),
                 "status": _network_status(client),
                 "state": _network_status(client),
+                "room": site_name,
                 "area": site_name,
-                "details": _details(
-                    client,
-                    [
-                        "ipAddress",
-                        "ip",
-                        "macAddress",
-                        "mac",
-                        "network",
-                        "wired",
-                        "wifiExperience",
-                        "signal",
-                        "rxRate",
-                        "txRate",
-                        "uplinkDeviceName",
-                        "lastSeen",
-                    ],
-                ),
+                "details": details,
             }
         )
     return {"devices": rows, "message": f"UniFi Network returned {len(rows)} devices and clients from {site_name}."}

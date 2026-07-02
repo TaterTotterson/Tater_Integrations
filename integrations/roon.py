@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.5"
+__version__ = "1.2.1"
 
 import contextlib
 import json
@@ -40,6 +40,7 @@ INTEGRATION = {
     "description": "Roon Core pairing, zone transport controls, and library browse playback targets.",
     "badge": "RO",
     "order": 55,
+    "capabilities": ["speaker", "media_player", "audio_output", "music"],
     "fields": [
         {
             "key": "roon_enabled",
@@ -843,11 +844,21 @@ def _zone_device(zone: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, An
         "ref": f"zone:{zone_id}" if zone_id else "",
         "capabilities": capabilities,
         "actions": actions,
+        "features": [
+            "speaker",
+            "playback",
+            "queue",
+            "library_browse",
+            *(("volume", "mute") if "volume" in capabilities else ()),
+        ],
         "state": state,
         "status": state,
+        "room": name,
+        "area": name,
         "details": {
             "zone_id": zone_id,
             "alias": alias,
+            "room": name,
             "roon_display_name": zone.get("display_name"),
             "now_playing": _now_playing_text(zone.get("now_playing")),
             "outputs": outputs,
@@ -1023,14 +1034,20 @@ def _is_browse_header(item: Dict[str, Any]) -> bool:
     return _text(item.get("hint")).lower() == "header" or not _text(item.get("item_key"))
 
 
+def _title_has_playback_action(title: str) -> bool:
+    return bool(re.search(r"\b(play|shuffle|radio|queue|add)\b", _text(title).lower()))
+
+
+def _is_direct_action_item(item: Dict[str, Any]) -> bool:
+    return _text(item.get("hint")).lower() == "action"
+
+
 def _action_item_score(item: Dict[str, Any], *, media_kind: str, randomize: bool, enqueue: bool) -> int:
     if _is_browse_header(item):
         return -1
     title = _text(item.get("title")).lower()
     hint = _text(item.get("hint")).lower()
-    if hint not in {"action", "action_list"} and not any(
-        token in title for token in ("play", "shuffle", "radio", "queue", "add")
-    ):
+    if hint not in {"action", "action_list"} and not _title_has_playback_action(title):
         return -1
     score = 0
     if enqueue:
@@ -1150,6 +1167,17 @@ def _activate_browse_items(
     if action_item:
         result = _browse_select(client, hierarchy=hierarchy, session_key=session_key, zone_id=zone_id, item=action_item)
         action = _text(result.get("action"))
+        if action == "message" and result.get("is_error"):
+            raise RuntimeError(_browse_result_message(result))
+        if _is_direct_action_item(action_item):
+            return {
+                "ok": True,
+                "action": "queue_media" if enqueue else "play_media",
+                "selected": action_item,
+                "message": _browse_result_message(result),
+                "browse_result": result,
+                "browse_action": action,
+            }
         if action == "list":
             next_items, _loaded = _browse_load_items(client, hierarchy=hierarchy, session_key=session_key, count=100)
             return _activate_browse_items(
@@ -1164,14 +1192,13 @@ def _activate_browse_items(
                 enqueue=enqueue,
                 depth=depth + 1,
             )
-        if action == "message" and result.get("is_error"):
-            raise RuntimeError(_browse_result_message(result))
         return {
             "ok": True,
             "action": "queue_media" if enqueue else "play_media",
             "selected": action_item,
             "message": _browse_result_message(result),
             "browse_result": result,
+            "browse_action": action,
         }
 
     item = _choose_browse_item(items, query=query, media_kind=media_kind)

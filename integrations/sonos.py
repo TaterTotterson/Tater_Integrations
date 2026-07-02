@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.3"
+__version__ = "1.2.3"
 
 import contextlib
 import html
@@ -43,6 +43,7 @@ INTEGRATION = {
     "description": "Sonos speaker discovery and direct playback targets for announcements.",
     "badge": "SON",
     "order": 50,
+    "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"],
     "fields": [
         {
             "key": "sonos_enabled",
@@ -102,6 +103,14 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     except Exception:
         parsed = int(default)
     return max(int(minimum), min(int(maximum), parsed))
+
+
+def _sonos_room_name(speaker: Dict[str, Any]) -> str:
+    name = _text(speaker.get("room") or speaker.get("room_name") or speaker.get("name") or speaker.get("display_name"))
+    for suffix in (" Stereo Pair", " Surrounds", " Home Theater", " Speaker"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)].strip()
+    return name or "Sonos"
 
 
 def read_sonos_settings(client: Any = None) -> Dict[str, Any]:
@@ -550,7 +559,22 @@ def _sonos_audio_clip_host(speaker: Dict[str, Any]) -> str:
     return _sonos_host_from_value(speaker.get("host")) or _sonos_host_from_value(speaker.get("root_url"))
 
 
+def _sonos_is_group_target(speaker: Dict[str, Any]) -> bool:
+    row = speaker if isinstance(speaker, dict) else {}
+    kind = _text(row.get("sonos_target_kind")).lower()
+    if kind in {"stereo_pair", "home_theater", "set"}:
+        return True
+    try:
+        return int(float(_text(row.get("member_count")) or "1")) > 1
+    except Exception:
+        return False
+
+
 def _sonos_audio_clip_player_id(speaker: Dict[str, Any]) -> str:
+    if _sonos_is_group_target(speaker):
+        group_id = _text(speaker.get("zone_group_id"))
+        if group_id:
+            return group_id
     return (
         sonos_target_id(speaker.get("coordinator_id"))
         or sonos_target_id(speaker.get("id"))
@@ -560,48 +584,17 @@ def _sonos_audio_clip_player_id(speaker: Dict[str, Any]) -> str:
 
 def _sonos_audio_clip_member_targets(speaker: Dict[str, Any]) -> List[Dict[str, Any]]:
     row = speaker if isinstance(speaker, dict) else {}
-    kind = _text(row.get("sonos_target_kind")).lower()
-    if kind != "stereo_pair":
-        return [dict(row)]
-
-    member_rows = row.get("member_rows") if isinstance(row.get("member_rows"), list) else []
-    targets: List[Dict[str, Any]] = []
-    if member_rows:
-        for member in member_rows:
-            if not isinstance(member, dict):
-                continue
-            member_id = sonos_target_id(member.get("id") or member.get("udn"))
-            if not member_id:
-                continue
-            next_row = dict(row)
-            next_row["id"] = member_id
-            next_row["udn"] = _text(member.get("udn")) or f"uuid:{member_id}"
-            next_row["coordinator_id"] = ""
-            next_row["host"] = _text(member.get("host")) or _text(row.get("host"))
-            next_row["root_url"] = normalize_sonos_root(member.get("root_url")) or _text(row.get("root_url"))
-            targets.append(next_row)
-    else:
-        member_ids = row.get("member_ids") if isinstance(row.get("member_ids"), list) else []
-        member_hosts = row.get("member_hosts") if isinstance(row.get("member_hosts"), list) else []
-        member_roots = row.get("member_root_urls") if isinstance(row.get("member_root_urls"), list) else []
-        for index, raw_id in enumerate(member_ids):
-            member_id = sonos_target_id(raw_id)
-            if not member_id:
-                continue
-            next_row = dict(row)
-            next_row["id"] = member_id
-            next_row["udn"] = f"uuid:{member_id}"
-            next_row["coordinator_id"] = ""
-            next_row["host"] = _text(member_hosts[index] if index < len(member_hosts) else "") or _text(row.get("host"))
-            next_row["root_url"] = (
-                normalize_sonos_root(member_roots[index] if index < len(member_roots) else "")
-                or _text(row.get("root_url"))
-            )
-            targets.append(next_row)
-
+    targets = [dict(row)]
+    if _sonos_is_group_target(row) and _text(row.get("zone_group_id")):
+        coordinator_target = dict(row)
+        coordinator_target["zone_group_id"] = ""
+        targets.append(coordinator_target)
+    # A stereo pair is already a single Sonos playback target. Sending AudioClip
+    # to each bonded member separately creates unsynced duplicate playback. If
+    # Sonos rejects the group id, fall back to the coordinator AudioClip target.
     deduped: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    for target in targets or [dict(row)]:
+    for target in targets:
         player_id = _sonos_audio_clip_player_id(target)
         if not player_id or player_id in seen:
             continue
@@ -693,13 +686,11 @@ def _sonos_play_audio_clip_targets_sync(
     for target in _sonos_audio_clip_member_targets(speaker):
         player_id = _sonos_audio_clip_player_id(target)
         try:
-            responses.extend(
-                _sonos_play_audio_clip_sync(
-                    target,
-                    source_url,
-                    timeout_s=timeout_s,
-                    volume=volume,
-                )
+            return _sonos_play_audio_clip_sync(
+                target,
+                source_url,
+                timeout_s=timeout_s,
+                volume=volume,
             )
         except Exception as exc:
             failures.append(f"{player_id or 'unknown'} ({exc})")
@@ -726,6 +717,23 @@ def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: f
         timeout_s=timeout_s,
     )
     _sonos_play(root_url, timeout_s=timeout_s)
+
+
+def _sonos_play_transport_with_restore(
+    root_url: str,
+    source_url: Any,
+    *,
+    timeout_s: float,
+    restore_after: bool = True,
+    restore_wait_s: Optional[float] = None,
+) -> None:
+    snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
+    _sonos_replace_transport_uri(root_url, source_url, timeout_s=timeout_s)
+    if not restore_after:
+        return
+    wait_s = restore_wait_s if restore_wait_s is not None else timeout_s
+    _sonos_wait_for_playback_end(root_url, timeout_s=max(1.0, float(wait_s or timeout_s or 1.0)))
+    _sonos_restore_player(root_url, snapshot, timeout_s=timeout_s)
 
 
 def _sonos_wait_for_playback_end(root_url: str, *, timeout_s: float) -> None:
@@ -1152,6 +1160,8 @@ def sonos_target_id(value: Any) -> str:
     lower = token.lower()
     if lower.startswith(SONOS_TARGET_PREFIX):
         token = _text(token[len(SONOS_TARGET_PREFIX) :])
+    if token.lower().startswith("speaker:"):
+        token = _text(token[len("speaker:") :])
     if token.lower().startswith("uuid:"):
         token = _text(token[5:])
     return token
@@ -1189,6 +1199,7 @@ def sonos_play_url_sync(
     timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
     restore_after: bool = True,
     restore_wait_s: Optional[float] = None,
+    prefer_audio_clip: bool = True,
 ) -> None:
     root_url = _text(speaker.get("root_url")) if isinstance(speaker, dict) else ""
     url = _text(source_url)
@@ -1200,22 +1211,34 @@ def sonos_play_url_sync(
     state = ""
     with contextlib.suppress(Exception):
         state = _sonos_current_transport_state(root_url, timeout_s=min(5.0, timeout_s))
-    try:
-        _sonos_play_audio_clip_targets_sync(speaker, url, timeout_s=timeout_s)
-        return
-    except Exception as exc:
-        if state not in {"STOPPED", "NO_MEDIA_PRESENT"}:
-            raise RuntimeError(
-                "Sonos audio clip failed while the speaker was playing or its state was unknown; "
-                "refused to replace Sonos playback."
-            ) from exc
-        _sonos_replace_transport_uri(root_url, url, timeout_s=timeout_s)
+    if prefer_audio_clip:
+        try:
+            _sonos_play_audio_clip_targets_sync(speaker, url, timeout_s=timeout_s)
+            return
+        except Exception as exc:
+            if state not in {"STOPPED", "NO_MEDIA_PRESENT"}:
+                raise RuntimeError(
+                    "Sonos audio clip failed while the speaker was playing or its state was unknown; "
+                    "refused to replace Sonos playback."
+                ) from exc
+
+    if not prefer_audio_clip and state not in {"STOPPED", "NO_MEDIA_PRESENT"} and not restore_after:
+        raise RuntimeError("Sonos transport playback would replace active playback and restore is disabled.")
+
+    _sonos_play_transport_with_restore(
+        root_url,
+        url,
+        timeout_s=timeout_s,
+        restore_after=restore_after,
+        restore_wait_s=restore_wait_s,
+    )
 
 
 def sonos_play_media_sync(
     *,
     speakers: List[str],
     source_url: Any,
+    media_content_type: Any = "",
     timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
     restore_after: bool = True,
     restore_wait_s: Optional[float] = None,
@@ -1226,6 +1249,8 @@ def sonos_play_media_sync(
     url = _text(source_url)
     if not url:
         return {"ok": False, "sent_count": 0, "error": "Sonos announcement URL is missing."}
+    media_kind = _text(media_content_type).lower()
+    prefer_audio_clip = media_kind not in {"music", "audio", "song", "media"}
 
     sent_count = 0
     failures: List[str] = []
@@ -1240,6 +1265,7 @@ def sonos_play_media_sync(
                 timeout_s=timeout_s,
                 restore_after=restore_after,
                 restore_wait_s=restore_wait_s,
+                prefer_audio_clip=prefer_audio_clip,
             )
             sent_count += 1
         except Exception as exc:
@@ -1283,6 +1309,7 @@ def integration_devices() -> Dict[str, Any]:
         if not isinstance(speaker, dict):
             continue
         speaker_id = _text(speaker.get("id")) or _text(speaker.get("udn"))
+        room = _sonos_room_name(speaker)
         devices.append(
             {
                 "id": speaker_id,
@@ -1291,9 +1318,13 @@ def integration_devices() -> Dict[str, Any]:
                 "ref": f"speaker:{speaker_id}" if speaker_id else "",
                 "capabilities": ["speaker", "media_player", "audio_output", "announcement_target", "play_media"],
                 "actions": ["play_media", "play_url", "announce"],
+                "features": ["announcement", "play_media", "speaker"],
                 "status": "available",
                 "state": "available",
+                "room": room,
+                "area": room,
                 "details": {
+                    "room": room,
                     "model": speaker.get("model"),
                     "host": speaker.get("host"),
                     "root_url": speaker.get("root_url"),

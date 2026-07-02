@@ -17,13 +17,23 @@ Each integration is a single Python module in `integrations/`. The module is sel
 
 At boot and when integration settings change, Tater reads `manifest.json`. Only enabled integrations are downloaded into Tater's local runtime `integrations/` folder. If an integration is disabled, nothing should import it and Tater should continue to run without it.
 
+## Current integration model
+
+Tater integrations expose provider devices into one shared device catalog. Tater then builds categories such as lights, plugs, switches, cameras, entry sensors, thermostats, garage doors, speakers, and network devices from each device's `type`, `capabilities`, `features`, and `actions`.
+
+The important rule is that integrations describe what a device really is. Do not expose a device as a light, switch, speaker, or sensor because its name or room contains that word. A UniFi network client named "SonosZP" is still a `network_device`; a Shelly Plug is a `plug`; a Hue light is a `light`.
+
+Generic category Verbas and cores use this shared catalog. Provider-specific Verbas should only be needed when the provider has provider-specific behavior, such as Roon library browsing or music search.
+
+Tater owns user organization on top of the provider data. Integrations should report the native provider room/area and stable device names, while Tater's Integrations > Organize UI stores user aliases, room renames, room merges, device renames, and preferred media players. Do not write those Tater aliases back into integration modules.
+
 ## Build a basic integration
 
 1. Create a module at `integrations/example.py`.
 2. Add `__version__` and an `INTEGRATION` metadata block.
 3. Implement settings helpers so the Integration Settings page can read and save values.
 4. Implement `integration_status()` so Tater can show whether it is configured.
-5. Implement `integration_devices()` if the integration exposes devices.
+5. Implement `integration_devices()` if the integration exposes devices, sensors, players, or categories.
 6. Implement `run_integration_action()` for shop/settings actions such as `test`, `discover`, or `pair`.
 7. Implement `run_integration_device_action()` if devices can do things like snapshot, open, close, play audio, or turn on/off.
 8. Add the integration entry to `manifest.json`, including version and SHA-256.
@@ -163,6 +173,8 @@ def integration_devices() -> Dict[str, Any]:
             "actions": ["turn_on", "turn_off"],
             "event_sources": [],
             "state": "unknown",
+            "room": "Living Room",
+            "area": "Living Room",
             "details": {},
         }
     ]
@@ -209,7 +221,7 @@ Tater looks for these functions by name. Only implement the ones your integratio
 - `run_integration_device_action(action_id, device_id, payload)`: runs actions against a specific exposed device.
 - `integration_poll_events(client=None, cursor=None)`: optionally returns events/states for runtime polling.
 
-Provider-specific helper functions are fine too. Existing cores and verba can lazy-load them through Tater's integration store, but new generic behavior should prefer shared capability hooks such as the device contract and web search contract.
+Provider-specific helper functions are fine too. Existing cores and Verbas can lazy-load them through Tater's integration store, but new generic behavior should prefer shared capability hooks such as the device contract, media playback contract, web search contract, and runtime polling contract.
 
 ## Settings fields
 
@@ -243,6 +255,9 @@ def integration_devices():
                 "ref": "camera:front_door",
                 "capabilities": ["camera", "snapshot", "motion", "doorbell"],
                 "actions": ["camera_snapshot"],
+                "state": "online",
+                "room": "Porch",
+                "area": "Porch",
                 "event_sources": [
                     {"type": "motion", "ref": "binary_sensor.front_door_motion", "state_on": "on"},
                     {"type": "doorbell", "ref": "event.front_door_doorbell", "state_on": "on"},
@@ -253,7 +268,92 @@ def integration_devices():
     }
 ```
 
-Tater uses `capabilities` to build shared catalogs such as all cameras, entry sensors, temperature sensors, speakers, garage doors, web search providers, and network presence targets. Common capabilities include `camera`, `snapshot`, `doorbell`, `motion`, `entry_sensor`, `contact`, `door`, `window`, `garage`, `garage_door`, `open_close`, `temperature`, `humidity`, `thermostat`, `hvac`, `light`, `switch`, `speaker`, `media_player`, `audio_output`, `announcement_target`, `web_search`, `network_device`, `client`, `presence`, and `connectivity`.
+Device rows should use stable identifiers:
+
+- `id`: stable provider/device id used by `run_integration_device_action()`.
+- `ref`: stable resource reference for UI, events, runtime state, and cross-system matching.
+- `name`: provider-reported user-facing name.
+- `type`: the primary category, such as `light`, `plug`, `camera`, `entry_sensor`, or `network_device`.
+- `capabilities`: category and behavior tags used by generic Verbas and cores.
+- `actions`: action ids accepted by `run_integration_device_action()`.
+- `state` and `status`: current state if cheaply available.
+- `room` and `area`: provider-reported native room/area only. Tater may override these in Organize.
+- `details`: provider-specific metadata that is useful for UI or debugging.
+
+Tater uses `type`, `capabilities`, `features`, and `actions` to build shared catalogs such as all cameras, entry sensors, temperature sensors, speakers, garage doors, web search providers, and network presence targets. Common capabilities include `battery`, `camera`, `snapshot`, `doorbell`, `motion`, `entry_sensor`, `contact`, `door`, `window`, `garage`, `garage_door`, `open_close`, `temperature`, `humidity`, `thermostat`, `hvac`, `light`, `switch`, `plug`, `cover`, `fan`, `lock`, `remote`, `scene`, `script`, `energy`, `illuminance`, `leak`, `speaker`, `media_player`, `audio_output`, `announcement_target`, `web_search`, `network_device`, `client`, `presence`, and `connectivity`.
+
+Preferred `type` values include:
+
+- `light`: lights and dimmable/color light resources.
+- `plug`: controllable outlet or plug devices.
+- `switch`: real switch devices that are not plugs, lights, or network switches.
+- `cover`: blinds, shades, curtains, and similar open/close devices.
+- `garage_door`: garage doors and openers.
+- `camera`: cameras and doorbells with snapshots or streams.
+- `entry_sensor`: contact/open-close sensors.
+- `temperature`, `humidity`, `illuminance`, `leak`, `battery`, `energy`: sensor categories.
+- `thermostat`: HVAC climate devices.
+- `speaker`: speakers, zones, and audio output targets.
+- `network_device`: routers, access points, switches, clients, and presence-style network inventory.
+
+Keep provider semantics clear. For example, a network switch from UniFi should be `network_device`, not `switch`; a media player visible as a network client should remain `network_device` in the UniFi Network integration and should only be a `speaker` in the Sonos/Roon/media integration that can actually play audio.
+
+## Organize, rooms, and aliases
+
+Tater builds a master room list from integration-reported `room`, `area`, and device metadata. The Integrations > Organize UI lets users:
+
+- Rename rooms.
+- Merge provider rooms into one Tater room.
+- Move devices between Tater rooms.
+- Rename devices.
+- Set a preferred media player for a room.
+
+Integrations should not persist these Tater-side changes. Keep reporting the provider's native names and rooms. Tater stores the alias/override layer in its own registry and applies it when generic Verbas, cores, and the UI read the shared device catalog.
+
+## Media playback contract
+
+Generated-audio Verbas and cores do not call provider-specific speaker code directly. They call Tater's shared media dispatcher with a normalized target:
+
+- `voice_core:<selector>` for a satellite.
+- `sonos:<speaker_id>` for Tater's built-in Sonos paired-speaker path.
+- `integration:<integration_id>:<url-encoded-device-id>` for future media integrations.
+- `ha:<media_player.entity_id>` for legacy Home Assistant media player targets.
+
+To appear as a generic integration media target, expose a device with `type: "speaker"` or `type: "media_player"` and capabilities such as `speaker`, `media_player`, `audio_output`. If the device can play an arbitrary URL, add `play_url` to `actions`. If it supports media playback through a generic media action, add `play_media` and include `announcement_target` in `capabilities`.
+
+Example speaker device:
+
+```python
+{
+    "id": "zone:family_room",
+    "name": "Family Room Speaker",
+    "type": "speaker",
+    "ref": "speaker:family_room",
+    "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"],
+    "actions": ["play_url", "play_media"],
+    "state": "available",
+    "room": "Family Room",
+    "area": "Family Room",
+}
+```
+
+The dispatcher calls `run_integration_device_action()` with a payload like this:
+
+```python
+{
+    "source_url": "http://tater.local:8501/api/speech/tts/runtime/<asset_id>/audio.mp3",
+    "url": "http://tater.local:8501/api/speech/tts/runtime/<asset_id>/audio.mp3",
+    "media_url": "http://tater.local:8501/api/speech/tts/runtime/<asset_id>/audio.mp3",
+    "media_content_id": "http://tater.local:8501/api/speech/tts/runtime/<asset_id>/audio.mp3",
+    "media_content_type": "music",
+    "media_type": "audio/mpeg",
+    "timeout_s": 360.0,
+}
+```
+
+Use the first available URL field. Return `{"ok": True, "sent_count": 1}` when playback starts. Return `{"ok": False, "error": "..."}` when playback cannot start.
+
+Do not mark provider-specific library playback as generic URL playback. Roon is a good example: playing "the Eagles" is a music-library operation, not "play this URL". That should stay behind a provider-specific Verba or action unless the provider can also play arbitrary URLs.
 
 ## Web search contract
 
@@ -308,4 +408,44 @@ def run_integration_device_action(action_id, device_id, payload):
 
 Other device actions use the same hook. For example, a garage door can expose `actions: ["open", "close"]`, a light can expose `actions: ["turn_on", "turn_off"]`, and a thermostat can expose `actions: ["set_temperature", "set_hvac_mode"]`.
 
-Optional runtime polling can be exposed with `integration_poll_events(client=None, cursor=None)`. Return `{"events": [...], "states": [...], "cursor": next_cursor}` where event payloads include a `ref`, `entity_id`, or `id` matching one of the device/event refs.
+## Runtime polling contract
+
+Tater runs a live integration runtime. It periodically refreshes the device registry cache and calls optional provider pollers so the UI and Verbas can read recent device state quickly instead of rebuilding every provider list on demand.
+
+Expose one of these functions if the integration can cheaply poll recent changes:
+
+- `integration_poll_events(client=None, cursor=None)`
+- `poll_integration_events(client=None, cursor=None)`
+- `integration_runtime_poll(client=None, cursor=None)`
+
+Set `INTEGRATION_RUNTIME_POLL_SECONDS` or `INTEGRATION["runtime_poll_seconds"]` when the default 30 second interval is not right.
+
+Return:
+
+```python
+{
+    "states": [
+        {
+            "id": "binary_sensor.front_door_contact",
+            "ref": "binary_sensor.front_door_contact",
+            "entity_id": "binary_sensor.front_door_contact",
+            "name": "Front Door",
+            "state": "closed",
+            "room": "Entry",
+        }
+    ],
+    "events": [
+        {
+            "kind": "state_changed",
+            "entity_id": "binary_sensor.front_door_contact",
+            "state": "open",
+            "previous_state": "closed",
+        }
+    ],
+    "cursor": {"last_seen": "provider-specific cursor"}
+}
+```
+
+State and event payloads must include one of `entity_id`, `ref`, `device_ref`, `resource_ref`, `id`, or `device_id` matching a device row or event source. Tater stores current states and recent events in its runtime cache and the Settings UI shows recent changes from that cache.
+
+Optional runtime polling can also return only `states`, only `events`, or a plain list of events. If there are no changes, return empty lists and the next cursor.

@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 import asyncio
 import io
@@ -21,6 +21,25 @@ INTEGRATION = {
     "description": "Shared Home Assistant endpoint and token for portals, verbas, and announcement paths.",
     "badge": "HA",
     "order": 10,
+    "capabilities": [
+        "light",
+        "switch",
+        "plug",
+        "sensor",
+        "garage_door",
+        "entry_sensor",
+        "motion",
+        "temperature",
+        "humidity",
+        "illuminance",
+        "energy",
+        "leak",
+        "battery",
+        "camera",
+        "cover",
+        "climate",
+        "media_player",
+    ],
     "fields": [
         {
             "key": "homeassistant_base_url",
@@ -204,6 +223,16 @@ async def device_registry_list(base_url: Any, token: Any, *, timeout_s: float = 
     return result if isinstance(result, list) else []
 
 
+async def area_registry_list(base_url: Any, token: Any, *, timeout_s: float = 30.0) -> list[dict]:
+    result = await call(
+        base_url,
+        token,
+        {"type": "config/area_registry/list", "id": 1},
+        timeout_s=timeout_s,
+    )
+    return result if isinstance(result, list) else []
+
+
 async def call_service(
     base_url: Any,
     token: Any,
@@ -264,6 +293,12 @@ def device_registry_list_sync(base_url: Any, token: Any, *, timeout_s: float = 3
     )
 
 
+def area_registry_list_sync(base_url: Any, token: Any, *, timeout_s: float = 30.0) -> list[dict]:
+    return _run_sync(
+        area_registry_list(base_url, token, timeout_s=timeout_s)
+    )
+
+
 def _homeassistant_rest_get(base_url: Any, token: Any, path: str, *, timeout_s: float = 20.0) -> Any:
     base = _text(base_url).rstrip("/")
     bearer = _text(token)
@@ -317,20 +352,166 @@ def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) ->
     if domain == "camera":
         add("camera")
         add("snapshot")
+    if domain == "light":
+        add("switch")
+        supported = attrs.get("supported_color_modes")
+        supported_text = " ".join(_text(item).lower() for item in supported) if isinstance(supported, list) else _text(supported).lower()
+        if any(token in supported_text for token in ("brightness", "color_temp", "xy", "rgb", "hs")):
+            add("dimmable")
+        if any(token in supported_text for token in ("xy", "rgb", "hs")):
+            add("color")
+    if domain in {"switch", "input_boolean"}:
+        add("switch")
+        if any(token in name_hint for token in ("plug", "outlet")):
+            add("plug")
+    if domain == "fan":
+        add("fan")
+        add("switch")
+    if domain == "cover":
+        add("cover")
+        add("open_close")
+        if device_class == "garage" or "garage" in name_hint:
+            add("garage_door")
+    if domain == "climate":
+        add("climate")
+        add("temperature")
+    if domain == "lock":
+        add("lock")
+    if domain == "media_player":
+        add("media_player")
+    if domain == "remote":
+        add("remote")
+    if domain == "scene":
+        add("scene")
+    if domain == "script":
+        add("script")
     if domain in {"binary_sensor", "sensor", "cover"}:
         if device_class in {"door", "garage_door", "window", "opening"} or any(
             token in name_hint for token in ("door", "window", "garage", "contact", "opening")
         ):
             add("entry_sensor")
+        if device_class == "garage_door" or "garage" in name_hint:
+            add("garage_door")
         if device_class == "motion" or "motion" in name_hint:
             add("motion")
         if device_class == "temperature" or unit in {"°c", "°f", "c", "f"} or "temp" in name_hint:
             add("temperature")
         if device_class == "humidity" or "humidity" in name_hint:
             add("humidity")
+        if device_class in {"illuminance", "light"} or unit in {"lx", "lux"} or any(
+            token in name_hint for token in ("illuminance", "lux", "light level")
+        ):
+            add("illuminance")
+        if device_class in {"power", "energy", "voltage", "current"} or unit in {"w", "kw", "kwh", "v", "a"}:
+            add("energy")
+        if device_class in {"battery"} or "battery" in name_hint:
+            add("battery")
+        if device_class in {"moisture", "water"} or any(token in name_hint for token in ("leak", "water", "flood", "moisture")):
+            add("leak")
     if any(token in name_hint for token in ("doorbell", "ring", "button", "press")):
         add("doorbell")
     return caps
+
+
+def _homeassistant_entity_actions(entity_id: str, capabilities: list[str]) -> list[str]:
+    domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
+    caps = {str(item or "").strip().lower() for item in capabilities or [] if str(item or "").strip()}
+    if domain == "light":
+        actions = ["turn_on", "turn_off", "toggle"]
+        if "dimmable" in caps:
+            actions.append("set_brightness")
+        if "color" in caps:
+            actions.append("set_color")
+        return actions
+    if domain in {"switch", "input_boolean"}:
+        return ["turn_on", "turn_off", "toggle"]
+    if domain == "fan":
+        return ["turn_on", "turn_off", "toggle", "set_percentage"]
+    if domain == "cover":
+        return ["open", "close", "stop", "set_position"]
+    if domain == "lock":
+        return ["lock", "unlock"]
+    if domain == "climate":
+        return ["set_temperature", "set_hvac_mode"]
+    if domain == "media_player":
+        return [
+            "play",
+            "pause",
+            "playpause",
+            "stop",
+            "next",
+            "previous",
+            "set_volume",
+            "volume_up",
+            "volume_down",
+            "mute",
+            "unmute",
+            "play_media",
+            "announce",
+        ]
+    if domain == "remote":
+        return ["turn_on", "turn_off", "send_command"]
+    if domain == "scene":
+        return ["activate"]
+    if domain == "script":
+        return ["run"]
+    if domain == "camera" or "snapshot" in caps:
+        return ["camera_snapshot"]
+    return []
+
+
+def _homeassistant_registry_context(base: str, token: str) -> Dict[str, Dict[str, Any]]:
+    context: Dict[str, Dict[str, Any]] = {
+        "entities": {},
+        "devices": {},
+        "areas": {},
+    }
+    try:
+        areas = area_registry_list_sync(base, token, timeout_s=8.0)
+        context["areas"] = {
+            _text(row.get("area_id") or row.get("id")): dict(row)
+            for row in areas
+            if isinstance(row, dict) and _text(row.get("area_id") or row.get("id"))
+        }
+    except Exception:
+        pass
+    try:
+        devices = device_registry_list_sync(base, token, timeout_s=8.0)
+        context["devices"] = {
+            _text(row.get("id")): dict(row)
+            for row in devices
+            if isinstance(row, dict) and _text(row.get("id"))
+        }
+    except Exception:
+        pass
+    try:
+        entities = entity_registry_list_sync(base, token, timeout_s=8.0)
+        context["entities"] = {
+            _text(row.get("entity_id")): dict(row)
+            for row in entities
+            if isinstance(row, dict) and _text(row.get("entity_id"))
+        }
+    except Exception:
+        pass
+    return context
+
+
+def _homeassistant_entity_room(entity_id: str, attrs: Dict[str, Any], registry_context: Dict[str, Dict[str, Any]]) -> str:
+    entity = (registry_context.get("entities") or {}).get(entity_id) or {}
+    devices = registry_context.get("devices") or {}
+    areas = registry_context.get("areas") or {}
+    device = devices.get(_text(entity.get("device_id"))) or {}
+    area_id = (
+        _text(entity.get("area_id"))
+        or _text(device.get("area_id"))
+        or _text(attrs.get("area_id"))
+        or _text(attrs.get("room"))
+        or _text(attrs.get("area"))
+    )
+    if not area_id:
+        return ""
+    area = areas.get(area_id) or {}
+    return _text(area.get("name")) or area_id.replace("_", " ").title()
 
 
 def integration_devices() -> Dict[str, Any]:
@@ -340,6 +521,7 @@ def integration_devices() -> Dict[str, Any]:
     if not token:
         return {"devices": [], "message": "Home Assistant is not configured."}
     states = _homeassistant_rest_get(base, token, "/api/states", timeout_s=20.0)
+    registry_context = _homeassistant_registry_context(base, token)
     devices: list[dict] = []
     for row in states if isinstance(states, list) else []:
         if not isinstance(row, dict):
@@ -351,6 +533,8 @@ def integration_devices() -> Dict[str, Any]:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
         state = _text(row.get("state"))
         capabilities = _homeassistant_entity_capabilities(entity_id, attrs)
+        actions = _homeassistant_entity_actions(entity_id, capabilities)
+        room = _homeassistant_entity_room(entity_id, attrs, registry_context)
         devices.append(
             {
                 "id": entity_id,
@@ -358,7 +542,10 @@ def integration_devices() -> Dict[str, Any]:
                 "type": domain,
                 "ref": entity_id,
                 "capabilities": capabilities,
-                "actions": ["camera_snapshot"] if "snapshot" in capabilities else [],
+                "actions": actions,
+                "features": actions,
+                "room": room,
+                "area": room,
                 "state": state,
                 "status": state,
                 "details": _homeassistant_entity_details(row),
@@ -384,10 +571,173 @@ def get_camera_snapshot(device_id: Any) -> tuple[bytes, str]:
 
 
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if _text(action_id) not in {"camera_snapshot", "snapshot"}:
+    action = _text(action_id).lower()
+    entity_id = _text(device_id)
+    if action in {"camera_snapshot", "snapshot"}:
+        content, content_type = get_camera_snapshot(entity_id)
+        return {"ok": True, "bytes": content, "content_type": content_type}
+
+    if "." not in entity_id:
+        raise ValueError("Home Assistant entity id is required.")
+    domain = entity_id.split(".", 1)[0]
+    service = ""
+    service_data: Dict[str, Any] = {}
+    target = {"entity_id": entity_id}
+    payload = dict(payload or {})
+
+    if action in {"turn_on", "on"}:
+        service = "turn_on"
+    elif action in {"turn_off", "off"}:
+        service = "turn_off"
+    elif action == "toggle":
+        service = "toggle"
+    elif action == "set_brightness":
+        service = "turn_on"
+        brightness = payload.get("brightness_pct", payload.get("brightness"))
+        if brightness is None:
+            raise ValueError("Home Assistant brightness action requires brightness_pct.")
+        service_data["brightness_pct"] = int(max(0, min(100, round(float(brightness)))))
+    elif action == "set_color":
+        service = "turn_on"
+        color_name = _text(payload.get("color_name"))
+        rgb_color = payload.get("rgb_color")
+        xy_color = payload.get("xy_color")
+        if color_name:
+            service_data["color_name"] = color_name
+        if isinstance(rgb_color, list) and len(rgb_color) == 3:
+            service_data["rgb_color"] = [int(max(0, min(255, round(float(item))))) for item in rgb_color]
+        if isinstance(xy_color, list) and len(xy_color) == 2:
+            service_data["xy_color"] = [float(xy_color[0]), float(xy_color[1])]
+        if not service_data:
+            raise ValueError("Home Assistant color action requires color_name, rgb_color, or xy_color.")
+    elif action == "open":
+        service = "open_cover"
+        domain = "cover"
+    elif action == "close":
+        service = "close_cover"
+        domain = "cover"
+    elif action == "stop":
+        service = "stop_cover"
+        domain = "cover"
+    elif action == "set_position":
+        service = "set_cover_position"
+        domain = "cover"
+        position = payload.get("position")
+        if position is None:
+            raise ValueError("Home Assistant cover position action requires position.")
+        service_data["position"] = int(max(0, min(100, round(float(position)))))
+    elif action == "set_percentage":
+        service = "set_percentage"
+        domain = "fan"
+        percentage = payload.get("percentage", payload.get("speed", payload.get("speed_pct")))
+        if percentage is None:
+            raise ValueError("Home Assistant fan speed action requires percentage.")
+        service_data["percentage"] = int(max(0, min(100, round(float(percentage)))))
+    elif action in {"lock", "unlock"}:
+        service = action
+        domain = "lock"
+    elif action == "activate":
+        service = "turn_on"
+        domain = "scene"
+    elif action == "run":
+        service = "turn_on"
+        domain = "script"
+    elif action == "send_command":
+        service = "send_command"
+        domain = "remote"
+        command = _text(payload.get("command"))
+        if not command:
+            raise ValueError("Home Assistant remote action requires command.")
+        service_data["command"] = command
+    elif action in {"set_temperature", "set_target_temperature", "target_temperature"}:
+        service = "set_temperature"
+        domain = "climate"
+        temperature = payload.get("temperature", payload.get("target_temperature"))
+        if temperature is None:
+            raise ValueError("Home Assistant climate temperature action requires temperature.")
+        service_data["temperature"] = float(temperature)
+        hvac_mode = _text(payload.get("hvac_mode") or payload.get("mode"))
+        if hvac_mode:
+            service_data["hvac_mode"] = hvac_mode
+    elif action in {"set_hvac_mode", "set_mode", "hvac_mode"}:
+        service = "set_hvac_mode"
+        domain = "climate"
+        hvac_mode = _text(payload.get("hvac_mode") or payload.get("mode"))
+        if not hvac_mode:
+            raise ValueError("Home Assistant climate mode action requires hvac_mode.")
+        service_data["hvac_mode"] = hvac_mode
+    elif action in {"play", "media_play", "resume"}:
+        service = "media_play"
+        domain = "media_player"
+    elif action in {"pause", "media_pause"}:
+        service = "media_pause"
+        domain = "media_player"
+    elif action in {"playpause", "play_pause", "media_play_pause"}:
+        service = "media_play_pause"
+        domain = "media_player"
+    elif action in {"stop", "media_stop"} and domain == "media_player":
+        service = "media_stop"
+        domain = "media_player"
+    elif action in {"next", "media_next_track"}:
+        service = "media_next_track"
+        domain = "media_player"
+    elif action in {"previous", "prev", "media_previous_track"}:
+        service = "media_previous_track"
+        domain = "media_player"
+    elif action == "set_volume":
+        service = "volume_set"
+        domain = "media_player"
+        volume = payload.get("volume", payload.get("volume_pct", payload.get("level")))
+        if volume is None:
+            raise ValueError("Home Assistant media volume action requires volume.")
+        service_data["volume_level"] = max(0.0, min(1.0, float(volume) / 100.0))
+    elif action == "volume_up":
+        service = "volume_up"
+        domain = "media_player"
+    elif action == "volume_down":
+        service = "volume_down"
+        domain = "media_player"
+    elif action in {"mute", "unmute"}:
+        service = "volume_mute"
+        domain = "media_player"
+        service_data["is_volume_muted"] = action == "mute"
+    elif action in {"play_media", "play_url", "announce"}:
+        service = "play_media"
+        domain = "media_player"
+        media_content_id = _text(
+            payload.get("media_content_id")
+            or payload.get("source_url")
+            or payload.get("url")
+            or payload.get("media_url")
+        )
+        if not media_content_id:
+            raise ValueError("Home Assistant media playback requires media_content_id or source_url.")
+        service_data["media_content_id"] = media_content_id
+        service_data["media_content_type"] = _text(payload.get("media_content_type") or payload.get("media_type") or "music")
+        if action == "announce":
+            service_data["announce"] = True
+    else:
         raise KeyError(f"Unsupported Home Assistant device action: {action_id}")
-    content, content_type = get_camera_snapshot(device_id)
-    return {"ok": True, "bytes": content, "content_type": content_type}
+
+    config = load_homeassistant_config(required=True)
+    result = call_service_sync(
+        config["base"],
+        config["token"],
+        domain=domain,
+        service=service,
+        service_data=service_data,
+        target=target,
+        timeout_s=20.0,
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "device_id": entity_id,
+        "domain": domain,
+        "service": service,
+        "service_data": service_data,
+        "result": result,
+    }
 
 
 def call_service_sync(

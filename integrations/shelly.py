@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 
 import contextlib
 import ipaddress
@@ -29,6 +29,7 @@ INTEGRATION = {
     "description": "Local Shelly device discovery and direct HTTP control for switches, lights, covers, and sensors.",
     "badge": "SH",
     "order": 40,
+    "capabilities": ["light", "switch", "plug", "cover", "sensor", "temperature", "humidity", "illuminance", "energy"],
     "fields": [
         {
             "key": "shelly_enabled",
@@ -54,6 +55,16 @@ INTEGRATION = {
             "rows": 6,
             "placeholder": "shellyplugus-d48afc77f360 = CRT TV\n10.4.20.231 = CRT TV",
             "description": "Optional. One per line: device id, MAC, IP, host, or URL = friendly name. Discovery adds blank entries for found devices.",
+            "full_width": True,
+        },
+        {
+            "key": "shelly_device_rooms",
+            "label": "Device Rooms",
+            "type": "textarea",
+            "default": "",
+            "rows": 5,
+            "placeholder": "shellyplugus-d48afc77f360 = Office\n10.4.20.231 = Living Room",
+            "description": "Optional. One per line: device id, MAC, IP, host, or URL = room name. Applies to all components on that Shelly device.",
             "full_width": True,
         },
         {
@@ -195,6 +206,10 @@ def _parse_device_aliases(value: Any) -> Dict[str, str]:
     return aliases
 
 
+def _parse_device_rooms(value: Any) -> Dict[str, str]:
+    return _parse_device_aliases(value)
+
+
 def _alias_template_lines(value: Any) -> Tuple[List[str], set[str]]:
     lines: List[str] = []
     keys: set[str] = set()
@@ -234,6 +249,17 @@ def _device_alias(root: str, info: Dict[str, Any], settings: Dict[str, Any]) -> 
         return ""
     for candidate in _device_alias_candidates(root, info):
         name = aliases.get(_alias_key(candidate))
+        if name:
+            return name
+    return ""
+
+
+def _device_room(root: str, info: Dict[str, Any], settings: Dict[str, Any]) -> str:
+    rooms = _parse_device_rooms((settings or {}).get("SHELLY_DEVICE_ROOMS"))
+    if not rooms:
+        return ""
+    for candidate in _device_alias_candidates(root, info):
+        name = rooms.get(_alias_key(candidate))
         if name:
             return name
     return ""
@@ -297,6 +323,7 @@ def read_shelly_settings(client: Any = None) -> Dict[str, Any]:
         "SHELLY_ENABLED": _as_bool(raw.get("SHELLY_ENABLED"), SHELLY_DEFAULT_ENABLED),
         "SHELLY_DEVICE_HOSTS": _text(raw.get("SHELLY_DEVICE_HOSTS")),
         "SHELLY_DEVICE_ALIASES": _text(raw.get("SHELLY_DEVICE_ALIASES")),
+        "SHELLY_DEVICE_ROOMS": _text(raw.get("SHELLY_DEVICE_ROOMS")),
         "SHELLY_USERNAME": _text(raw.get("SHELLY_USERNAME")),
         "SHELLY_PASSWORD": _text(raw.get("SHELLY_PASSWORD")),
         "SHELLY_TIMEOUT_SECONDS": str(timeout),
@@ -309,6 +336,7 @@ def save_shelly_settings(
     enabled: Any = None,
     device_hosts: Any = None,
     device_aliases: Any = None,
+    device_rooms: Any = None,
     username: Any = None,
     password: Any = None,
     timeout_seconds: Any = None,
@@ -325,6 +353,7 @@ def save_shelly_settings(
         "SHELLY_DEVICE_ALIASES": _text(
             current.get("SHELLY_DEVICE_ALIASES") if device_aliases is None else device_aliases
         ),
+        "SHELLY_DEVICE_ROOMS": _text(current.get("SHELLY_DEVICE_ROOMS") if device_rooms is None else device_rooms),
         "SHELLY_USERNAME": _text(current.get("SHELLY_USERNAME") if username is None else username),
         "SHELLY_PASSWORD": _text(current.get("SHELLY_PASSWORD") if password is None else password),
         "SHELLY_TIMEOUT_SECONDS": str(
@@ -642,6 +671,24 @@ def _component_id(device_key: str, component_type: str, component_index: Any) ->
     return f"shelly:{device_key}:{component_type}:{_text(component_index) or '0'}"
 
 
+def _is_shelly_plug(info: Dict[str, Any]) -> bool:
+    identity = " ".join(
+        _text(info.get(key)).lower()
+        for key in ("id", "model", "type", "app", "hostname", "name")
+        if _text(info.get(key))
+    )
+    return "plug" in identity
+
+
+def _switch_device_type_and_caps(info: Dict[str, Any], row: Optional[Dict[str, Any]] = None) -> Tuple[str, List[str], Dict[str, Any]]:
+    device_type = "plug" if _is_shelly_plug(info) else "switch"
+    caps = [device_type]
+    source = row if isinstance(row, dict) else {}
+    if any(item in source for item in ("apower", "voltage", "current", "aenergy", "power", "energy")):
+        caps.extend(["power_meter", "energy"])
+    return device_type, caps, {"device_class": device_type}
+
+
 def _details(
     root: str,
     info: Dict[str, Any],
@@ -716,6 +763,7 @@ def _gen2_devices(
     devices: List[Dict[str, Any]] = []
     device_key = _device_key(root, info)
     alias = _device_alias(root, info, settings)
+    room = _device_room(root, info, settings)
     base_name = _device_name(root, info, config, settings)
     single_control_keys = _gen2_control_keys(status)
     for key, row in sorted((status or {}).items()):
@@ -735,21 +783,19 @@ def _gen2_devices(
 
         if component_type == "switch":
             state = _state_from_bool(row.get("output"))
-            caps = ["switch"]
-            if any(item in row for item in ("apower", "voltage", "current", "aenergy")):
-                caps.extend(["power_meter", "energy"])
+            device_type, caps, class_details = _switch_device_type_and_caps(info, row)
             devices.append(
                 {
                     "id": ref,
                     "name": name,
-                    "type": "switch",
+                    "type": device_type,
                     "ref": ref,
                     "capabilities": caps,
                     "actions": ["turn_on", "turn_off", "toggle"],
                     "event_sources": [{"type": "switch", "ref": ref, "state_on": "on", "state_off": "off"}],
                     "status": state,
                     "state": state,
-                    "details": _details(root, info, component, row, alias=alias),
+                    "details": _details(root, info, component, {**row, **class_details}, alias=alias),
                 }
             )
             continue
@@ -842,6 +888,13 @@ def _gen2_devices(
                     "details": _details(root, info, component, row, alias=alias),
                 }
             )
+    for device in devices:
+        device["room"] = room
+        device["area"] = room
+        details = device.get("details") if isinstance(device.get("details"), dict) else {}
+        if room:
+            details["room"] = room
+        device["details"] = details
     return devices
 
 
@@ -855,6 +908,7 @@ def _gen1_devices(
     devices: List[Dict[str, Any]] = []
     device_key = _device_key(root, info)
     alias = _device_alias(root, info, settings)
+    room = _device_room(root, info, settings)
     base_name = _device_name(root, info, config, settings)
     control_count = sum(
         len(rows)
@@ -874,9 +928,7 @@ def _gen1_devices(
         ref = _component_id(device_key, "relay", index)
         state = _state_from_bool(relay.get("ison"))
         meter = _meter_details_for_index(status, index)
-        caps = ["switch"]
-        if meter or any(item in relay for item in ("power", "energy")):
-            caps.extend(["power_meter", "energy"])
+        device_type, caps, class_details = _switch_device_type_and_caps(info, {**relay, "meter": meter})
         devices.append(
             {
                 "id": ref,
@@ -887,14 +939,14 @@ def _gen1_devices(
                     relay_config,
                     use_base_name=bool(alias and control_count == 1),
                 ),
-                "type": "switch",
+                "type": device_type,
                 "ref": ref,
                 "capabilities": caps,
                 "actions": ["turn_on", "turn_off", "toggle"],
                 "event_sources": [{"type": "switch", "ref": ref, "state_on": "on", "state_off": "off"}],
                 "status": state,
                 "state": state,
-                "details": _details(root, info, {"type": "relay", "id": index}, {**relay, "meter": meter}, alias=alias),
+                "details": _details(root, info, {"type": "relay", "id": index}, {**relay, "meter": meter, **class_details}, alias=alias),
             }
         )
 
@@ -1026,6 +1078,13 @@ def _gen1_devices(
                 "details": _details(root, info, {"type": "meter", "id": index}, meter, alias=alias),
             }
         )
+    for device in devices:
+        device["room"] = room
+        device["area"] = room
+        details = device.get("details") if isinstance(device.get("details"), dict) else {}
+        if room:
+            details["room"] = room
+        device["details"] = details
     return devices
 
 
@@ -1038,6 +1097,7 @@ def _fallback_device(
 ) -> Dict[str, Any]:
     device_key = _device_key(root, info)
     alias = _device_alias(root, info, settings)
+    room = _device_room(root, info, settings)
     name = _device_name(root, info, config, settings)
     state = "online"
     if isinstance(status.get("wifi_sta"), dict) and status.get("wifi_sta", {}).get("connected") is False:
@@ -1051,6 +1111,8 @@ def _fallback_device(
         "capabilities": ["network_device", "connectivity"],
         "actions": [],
         "event_sources": [{"type": "connectivity", "ref": ref, "state_on": "online", "state_off": "offline"}],
+        "room": room,
+        "area": room,
         "status": state,
         "state": state,
         "details": _details(root, info, {"type": "device", "id": 0}, status if isinstance(status, dict) else {}, alias=alias),
@@ -1275,6 +1337,7 @@ def read_integration_settings() -> Dict[str, Any]:
         "shelly_enabled": _as_bool(settings.get("SHELLY_ENABLED"), SHELLY_DEFAULT_ENABLED),
         "shelly_device_hosts": settings.get("SHELLY_DEVICE_HOSTS", ""),
         "shelly_device_aliases": settings.get("SHELLY_DEVICE_ALIASES", ""),
+        "shelly_device_rooms": settings.get("SHELLY_DEVICE_ROOMS", ""),
         "shelly_username": settings.get("SHELLY_USERNAME", ""),
         "shelly_password": settings.get("SHELLY_PASSWORD", ""),
         "shelly_timeout_seconds": int(settings.get("SHELLY_TIMEOUT_SECONDS") or SHELLY_DEFAULT_TIMEOUT_SECONDS),
@@ -1289,6 +1352,7 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         enabled=(payload or {}).get("shelly_enabled"),
         device_hosts=(payload or {}).get("shelly_device_hosts"),
         device_aliases=(payload or {}).get("shelly_device_aliases"),
+        device_rooms=(payload or {}).get("shelly_device_rooms"),
         username=(payload or {}).get("shelly_username"),
         password=(payload or {}).get("shelly_password"),
         timeout_seconds=(payload or {}).get("shelly_timeout_seconds"),
@@ -1298,6 +1362,7 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         "shelly_enabled": _as_bool(saved.get("SHELLY_ENABLED"), SHELLY_DEFAULT_ENABLED),
         "shelly_device_hosts": saved.get("SHELLY_DEVICE_HOSTS", ""),
         "shelly_device_aliases": saved.get("SHELLY_DEVICE_ALIASES", ""),
+        "shelly_device_rooms": saved.get("SHELLY_DEVICE_ROOMS", ""),
         "shelly_username": saved.get("SHELLY_USERNAME", ""),
         "shelly_password": saved.get("SHELLY_PASSWORD", ""),
         "shelly_timeout_seconds": int(saved.get("SHELLY_TIMEOUT_SECONDS") or SHELLY_DEFAULT_TIMEOUT_SECONDS),
@@ -1351,10 +1416,16 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
         merged_hosts = _dedupe_roots(existing_hosts + roots)
         added_hosts = [root for root in merged_hosts if root.lower() not in existing_keys]
         alias_template = _merge_alias_template(current_settings.get("SHELLY_DEVICE_ALIASES"), devices)
-        if roots or alias_template != _text(current_settings.get("SHELLY_DEVICE_ALIASES")):
+        room_template = _merge_alias_template(current_settings.get("SHELLY_DEVICE_ROOMS"), devices)
+        if (
+            roots
+            or alias_template != _text(current_settings.get("SHELLY_DEVICE_ALIASES"))
+            or room_template != _text(current_settings.get("SHELLY_DEVICE_ROOMS"))
+        ):
             save_shelly_settings(
                 device_hosts="\n".join(merged_hosts),
                 device_aliases=alias_template,
+                device_rooms=room_template,
             )
         saved_settings = read_integration_settings()
         blank_alias_count = sum(

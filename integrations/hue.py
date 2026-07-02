@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.3.3"
 
 import ipaddress
 import json
@@ -27,6 +27,7 @@ INTEGRATION = {
     "description": "Hue Bridge pairing and app key used by Tater lighting actions.",
     "badge": "HUE",
     "order": 20,
+    "capabilities": ["light", "switch", "sensor", "entry_sensor", "motion", "temperature", "humidity", "illuminance", "battery"],
     "fields": [
         {
             "key": "hue_bridge_host",
@@ -439,6 +440,27 @@ def _hue_v2_get(bridge: str, app_key: str, resource: str, *, timeout: int) -> Li
     return rows if isinstance(rows, list) else []
 
 
+def _existing_hue_link(bridge: str, app_key: str, *, timeout: int) -> Dict[str, Any]:
+    if not _text(app_key):
+        return {"ok": False, "message": "Hue app key is missing."}
+    try:
+        rows = _hue_v2_get(bridge, app_key, "bridge", timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    bridge_row = next((row for row in rows if isinstance(row, dict)), {})
+    bridge_id = _text(bridge_row.get("id"))
+    bridge_name = _hue_name(bridge_row, "Hue Bridge") if bridge_row else "Hue Bridge"
+    return {
+        "ok": True,
+        "code": "already_linked",
+        "message": f"Philips Hue is already linked to {bridge_name}. Tater reused the saved Hue app key.",
+        "hue_bridge_host": bridge,
+        "hue_app_key": _text(app_key),
+        "bridge_id": bridge_id,
+        "bridge_name": bridge_name,
+    }
+
+
 def _hue_v2_put(bridge: str, app_key: str, path: str, payload: Dict[str, Any], *, timeout: int) -> Dict[str, Any]:
     api_root = hue_clip_v2_root(bridge)
     headers = {"hue-application-key": app_key, "Accept": "application/json", "Content-Type": "application/json"}
@@ -470,9 +492,46 @@ def _hue_owner(row: Dict[str, Any]) -> str:
     return _text(owner.get("rid"))
 
 
+def _hue_room_map(bridge: str, app_key: str, *, timeout: int) -> Dict[str, str]:
+    rooms: Dict[str, str] = {}
+    for resource_type in ("room", "zone"):
+        try:
+            rows = _hue_v2_get(bridge, app_key, resource_type, timeout=timeout)
+        except Exception:
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _hue_name(row, resource_type.title())
+            room_id = _text(row.get("id"))
+            if room_id:
+                rooms[room_id] = name
+            children = row.get("children") if isinstance(row.get("children"), list) else []
+            services = row.get("services") if isinstance(row.get("services"), list) else []
+            for child in [*children, *services]:
+                if not isinstance(child, dict):
+                    continue
+                rid = _text(child.get("rid"))
+                if rid:
+                    rooms.setdefault(rid, name)
+    return rooms
+
+
 def _hue_resource_details(row: Dict[str, Any], resource_type: str) -> Dict[str, Any]:
     details: Dict[str, Any] = {}
-    for key in ("product_data", "services", "on", "dimming", "color_temperature", "temperature", "humidity", "motion", "contact"):
+    for key in (
+        "product_data",
+        "services",
+        "on",
+        "dimming",
+        "color_temperature",
+        "temperature",
+        "humidity",
+        "motion",
+        "contact",
+        "light",
+        "power_state",
+    ):
         value = row.get(key)
         if value not in (None, "", [], {}):
             details[key] = value
@@ -503,14 +562,24 @@ def _hue_resource_state(row: Dict[str, Any], resource_type: str) -> str:
         contact = row.get("contact") if isinstance(row.get("contact"), dict) else {}
         state = contact.get("contact_report", {}).get("state") if isinstance(contact.get("contact_report"), dict) else ""
         return _text(state)
+    if resource_type == "light_level":
+        light = row.get("light") if isinstance(row.get("light"), dict) else {}
+        value = light.get("light_level") or light.get("light_level_valid")
+        return _text(value)
+    if resource_type == "device_power":
+        power = row.get("power_state") if isinstance(row.get("power_state"), dict) else {}
+        value = power.get("battery_level") or power.get("battery_state")
+        return f"{value}%" if isinstance(value, (int, float)) else _text(value)
     return ""
 
 
 def _hue_resource_capabilities(row: Dict[str, Any], resource_type: str) -> List[str]:
     if resource_type == "light":
-        caps = ["light", "switch"]
+        caps = ["light"]
         if isinstance(row.get("dimming"), dict):
             caps.append("dimmable")
+        if isinstance(row.get("color"), dict):
+            caps.append("color")
         if isinstance(row.get("color_temperature"), dict):
             caps.append("color_temperature")
         return caps
@@ -521,12 +590,88 @@ def _hue_resource_capabilities(row: Dict[str, Any], resource_type: str) -> List[
     if resource_type == "motion":
         return ["sensor", "motion"]
     if resource_type == "contact":
-        return ["sensor", "contact", "entry_sensor"]
+        return ["sensor", "contact", "entry_sensor", "open_close"]
+    if resource_type == "light_level":
+        return ["sensor", "illuminance", "light_sensor"]
+    if resource_type == "device_power":
+        return ["sensor", "battery"]
     return ["device"]
 
 
 def _hue_resource_actions(resource_type: str) -> List[str]:
-    return ["turn_on", "turn_off"] if resource_type == "light" else []
+    return ["turn_on", "turn_off", "set_brightness", "set_color"] if resource_type == "light" else []
+
+
+_HUE_COLOR_RGB: Dict[str, List[int]] = {
+    "red": [255, 0, 0],
+    "orange": [255, 128, 0],
+    "amber": [255, 191, 0],
+    "yellow": [255, 255, 0],
+    "green": [0, 180, 0],
+    "lime": [128, 255, 0],
+    "blue": [0, 70, 255],
+    "cyan": [0, 255, 255],
+    "teal": [0, 128, 128],
+    "purple": [128, 0, 255],
+    "violet": [143, 0, 255],
+    "magenta": [255, 0, 255],
+    "pink": [255, 105, 180],
+    "white": [255, 244, 229],
+    "warm white": [255, 197, 143],
+    "cool white": [214, 225, 255],
+    "daylight": [220, 235, 255],
+}
+
+
+def _normalize_rgb(value: Any) -> List[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    out: List[int] = []
+    for item in value:
+        try:
+            out.append(max(0, min(255, int(round(float(item))))))
+        except Exception:
+            return None
+    return out
+
+
+def _rgb_to_xy(rgb: List[int]) -> List[float] | None:
+    normalized = _normalize_rgb(rgb)
+    if normalized is None:
+        return None
+
+    def gamma(channel: int) -> float:
+        c = channel / 255.0
+        return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+
+    r, g, b = [gamma(v) for v in normalized]
+    x_val = r * 0.664511 + g * 0.154324 + b * 0.162028
+    y_val = r * 0.283881 + g * 0.668433 + b * 0.047685
+    z_val = r * 0.000088 + g * 0.072310 + b * 0.986039
+    total = x_val + y_val + z_val
+    if total <= 0:
+        return None
+    return [round(x_val / total, 4), round(y_val / total, 4)]
+
+
+def _hue_xy_from_payload(payload: Dict[str, Any]) -> List[float] | None:
+    xy_color = payload.get("xy_color")
+    if isinstance(xy_color, (list, tuple)) and len(xy_color) == 2:
+        try:
+            return [round(max(0.0, min(1.0, float(xy_color[0]))), 4), round(max(0.0, min(1.0, float(xy_color[1]))), 4)]
+        except Exception:
+            pass
+    rgb = _normalize_rgb(payload.get("rgb_color"))
+    if rgb is not None:
+        return _rgb_to_xy(rgb)
+    color_name = " ".join(_text(payload.get("color_name")).lower().replace("_", " ").split())
+    if color_name:
+        if color_name in _HUE_COLOR_RGB:
+            return _rgb_to_xy(_HUE_COLOR_RGB[color_name])
+        for name, rgb_value in _HUE_COLOR_RGB.items():
+            if name in color_name:
+                return _rgb_to_xy(rgb_value)
+    return None
 
 
 def _hue_resource_event_sources(resource_type: str, ref: str) -> List[Dict[str, Any]]:
@@ -550,14 +695,27 @@ def integration_devices() -> Dict[str, Any]:
     if not app_key:
         return {"devices": [], "message": "Philips Hue is not linked."}
     devices: List[Dict[str, Any]] = []
-    for resource_type in ("device", "light", "temperature", "relative_humidity", "motion", "contact"):
-        for row in _hue_v2_get(bridge, app_key, resource_type, timeout=timeout):
+    errors: List[str] = []
+    seen_refs: set[str] = set()
+    rooms = _hue_room_map(bridge, app_key, timeout=timeout)
+    for resource_type in ("light", "temperature", "relative_humidity", "motion", "contact", "light_level", "device_power"):
+        try:
+            rows = _hue_v2_get(bridge, app_key, resource_type, timeout=timeout)
+        except Exception as exc:
+            errors.append(f"{resource_type}: {exc}")
+            continue
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             row_id = _text(row.get("id"))
             name = _hue_name(row, row_id or resource_type.title())
             state = _hue_resource_state(row, resource_type)
             ref = f"{resource_type}:{row_id}" if row_id else ""
+            ref_key = ref or f"{resource_type}:{name}"
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
+            room = rooms.get(row_id) or rooms.get(_hue_owner(row)) or ""
             devices.append(
                 {
                     "id": row_id or name,
@@ -566,13 +724,19 @@ def integration_devices() -> Dict[str, Any]:
                     "ref": ref,
                     "capabilities": _hue_resource_capabilities(row, resource_type),
                     "actions": _hue_resource_actions(resource_type),
+                    "features": _hue_resource_actions(resource_type),
                     "event_sources": _hue_resource_event_sources(resource_type, ref),
+                    "room": room,
+                    "area": room,
                     "status": state,
                     "state": state,
                     "details": _hue_resource_details(row, resource_type),
                 }
             )
-    return {"devices": devices, "message": f"Philips Hue returned {len(devices)} current resources."}
+    message = f"Philips Hue returned {len(devices)} current resources."
+    if errors:
+        message = f"{message} Some resource types could not be read: {'; '.join(errors[:4])}."
+    return {"devices": devices, "message": message, "warnings": errors}
 
 
 def _pair_bridge_once(bridge: str, *, device: str, timeout: int) -> Dict[str, Any]:
@@ -642,9 +806,30 @@ def pair_hue_bridge(
     device_type: Any = None,
     timeout_seconds: Any = None,
 ) -> Dict[str, Any]:
-    bridge = normalize_hue_bridge_root(bridge_host or read_hue_settings().get("HUE_BRIDGE_HOST"))
+    current_settings = read_hue_settings()
+    bridge = normalize_hue_bridge_root(bridge_host or current_settings.get("HUE_BRIDGE_HOST"))
     device = (_text(device_type) or HUE_DEFAULT_DEVICE_TYPE)[:40]
     timeout = _bounded_int(timeout_seconds, default=HUE_DEFAULT_TIMEOUT_SECONDS, minimum=2, maximum=60)
+    existing_app_key = _text(current_settings.get("HUE_APP_KEY"))
+
+    existing = _existing_hue_link(bridge, existing_app_key, timeout=timeout)
+    if existing.get("ok"):
+        saved = save_hue_settings(
+            bridge_host=bridge,
+            app_key=existing_app_key,
+            device_type=device,
+            timeout_seconds=timeout,
+        )
+        return {
+            "ok": True,
+            "code": "already_linked",
+            "message": existing.get("message") or "Philips Hue is already linked. Tater reused the saved Hue app key.",
+            "hue_bridge_host": saved.get("HUE_BRIDGE_HOST", bridge),
+            "hue_app_key": saved.get("HUE_APP_KEY", existing_app_key),
+            "bridge_id": existing.get("bridge_id"),
+            "bridge_name": existing.get("bridge_name"),
+            "discovered_bridge_hosts": [],
+        }
 
     first_result = _pair_bridge_once(bridge, device=device, timeout=timeout)
     attempts: List[Dict[str, Any]] = [first_result]
@@ -677,6 +862,28 @@ def pair_hue_bridge(
     discovered = discover_hue_bridge_roots(timeout)
     candidates = [root for root in _unique_bridge_roots(discovered) if root.lower() != bridge.lower()]
     for candidate in candidates:
+        existing = _existing_hue_link(candidate, existing_app_key, timeout=timeout)
+        if existing.get("ok"):
+            saved = save_hue_settings(
+                bridge_host=candidate,
+                app_key=existing_app_key,
+                device_type=device,
+                timeout_seconds=timeout,
+            )
+            return {
+                "ok": True,
+                "code": "already_linked",
+                "message": (
+                    f"Hue Bridge auto-detected at {candidate} and is already linked. "
+                    "Tater reused the saved Hue app key."
+                ),
+                "hue_bridge_host": saved.get("HUE_BRIDGE_HOST", candidate),
+                "hue_app_key": saved.get("HUE_APP_KEY", existing_app_key),
+                "bridge_id": existing.get("bridge_id"),
+                "bridge_name": existing.get("bridge_name"),
+                "discovered_bridge_hosts": discovered,
+            }
+
         result = _pair_bridge_once(candidate, device=device, timeout=timeout)
         attempts.append(result)
         if not result.get("ok"):
@@ -788,7 +995,7 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
         "light_off": False,
         "off": False,
     }
-    if action not in aliases:
+    if action not in aliases and action not in {"set_brightness", "set_color"}:
         raise KeyError(f"Unsupported Philips Hue device action: {action_id}")
     light_id = _text(device_id)
     if light_id.startswith("light:"):
@@ -801,10 +1008,27 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
     timeout = _bounded_int(settings.get("HUE_TIMEOUT_SECONDS"), default=HUE_DEFAULT_TIMEOUT_SECONDS, minimum=2, maximum=60)
     if not app_key:
         raise ValueError("Philips Hue is not linked.")
-    result = _hue_v2_put(bridge, app_key, f"light/{light_id}", {"on": {"on": bool(aliases[action])}}, timeout=timeout)
+    body: Dict[str, Any] = {}
+    if action in aliases:
+        body["on"] = {"on": bool(aliases[action])}
+    if action == "set_brightness":
+        brightness = (payload or {}).get("brightness_pct", (payload or {}).get("brightness"))
+        if brightness is None:
+            raise ValueError("Hue brightness action requires brightness_pct.")
+        pct = max(0.0, min(100.0, float(brightness)))
+        body["on"] = {"on": pct > 0}
+        if pct > 0:
+            body["dimming"] = {"brightness": pct}
+    if action == "set_color":
+        xy = _hue_xy_from_payload(payload or {})
+        if xy is None:
+            raise ValueError("Hue color action requires color_name, rgb_color, or xy_color.")
+        body["on"] = {"on": True}
+        body["color"] = {"xy": {"x": xy[0], "y": xy[1]}}
+    result = _hue_v2_put(bridge, app_key, f"light/{light_id}", body, timeout=timeout)
     return {
         "ok": True,
-        "action": "turn_on" if aliases[action] else "turn_off",
+        "action": "turn_on" if aliases.get(action) is True else "turn_off" if aliases.get(action) is False else action,
         "device_id": light_id,
         "result": result,
     }

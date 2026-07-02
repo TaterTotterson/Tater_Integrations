@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import base64
 import hashlib
@@ -24,6 +24,7 @@ INTEGRATION = {
     "description": "Direct Genie/Aladdin garage door login used by Tater garage door actions.",
     "badge": "ALD",
     "order": 30,
+    "capabilities": ["garage_door", "cover", "entry_sensor", "battery"],
     "fields": [
         {
             "key": "aladdin_username",
@@ -401,8 +402,9 @@ def integration_devices() -> Dict[str, Any]:
                 "name": _text(door.get("name")) or "Garage Door",
                 "type": "garage_door",
                 "ref": door_ref,
-                "capabilities": ["garage_door", "garage", "entry_sensor", "open_close", "door"],
+                "capabilities": ["garage_door", "garage", "cover", "entry_sensor", "open_close", "door", "battery"],
                 "actions": ["open", "close"],
+                "features": ["open_close", "battery"],
                 "event_sources": [
                     {
                         "type": "garage",
@@ -413,9 +415,12 @@ def integration_devices() -> Dict[str, Any]:
                 ],
                 "status": _text(door.get("status")),
                 "state": _text(door.get("status")),
+                "room": "Garage",
+                "area": "Garage",
                 "details": {
                     "device_id": door.get("device_id"),
                     "door_number": door.get("door_number"),
+                    "room": "Garage",
                     "link_status": door.get("link_status"),
                     "battery_level": door.get("battery_level"),
                     "rssi": door.get("rssi"),
