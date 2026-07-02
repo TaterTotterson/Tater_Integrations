@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import contextlib
 import html
@@ -40,7 +40,7 @@ SONOS_AUDIOCLIP_NAME = "Tater Announcement"
 INTEGRATION = {
     "id": "sonos",
     "name": "Sonos",
-    "description": "Sonos speaker discovery and direct playback targets for announcements.",
+    "description": "Sonos speaker discovery and direct playback targets for announcements and music.",
     "badge": "SON",
     "order": 50,
     "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"],
