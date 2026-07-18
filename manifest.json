@@ -138,9 +138,9 @@
       "id": "unifi_network",
       "name": "UniFi Network",
       "description": "UniFi Network API key for client and device inventory actions.",
-      "version": "1.2.3",
+      "version": "1.2.4",
       "entry": "integrations/unifi_network.py",
-      "sha256": "3a611638c8204f05d7cc10bc0d8269882a011e610e5d13d428628dec32a76cd1",
+      "sha256": "0b0145fa953a27cb1d97aac9d90f44ea75b4c6bfc3aa284e8cba02b3c4038c80",
       "required": false,
       "capabilities": ["network_device"]
     },

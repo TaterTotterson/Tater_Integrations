@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +15,7 @@ UNIFI_NETWORK_DEFAULT_BASE_URL = "https://10.4.20.1"
 UNIFI_NETWORK_DEFAULT_VERIFY_SSL = False
 UNIFI_NETWORK_DEFAULT_TIMEOUT = 20
 UNIFI_NETWORK_PAGE_LIMIT = 200
+UNIFI_NETWORK_DEFAULT_ROOM = "Network"
 
 INTEGRATION = {
     "id": "unifi_network",
@@ -297,6 +298,7 @@ def integration_devices() -> Dict[str, Any]:
             ],
         )
         details["network_role"] = _network_role(device, "device")
+        details["site_name"] = site_name
         if device_type:
             details["raw_type"] = device_type
         rows.append(
@@ -309,8 +311,8 @@ def integration_devices() -> Dict[str, Any]:
                 "event_sources": _network_event_sources("device", device_ref),
                 "status": _network_status(device),
                 "state": _network_status(device),
-                "room": site_name,
-                "area": site_name,
+                "room": UNIFI_NETWORK_DEFAULT_ROOM,
+                "area": UNIFI_NETWORK_DEFAULT_ROOM,
                 "details": details,
             }
         )
@@ -339,6 +341,7 @@ def integration_devices() -> Dict[str, Any]:
             ],
         )
         details["network_role"] = "client"
+        details["site_name"] = site_name
         rows.append(
             {
                 "id": client_id or name,
@@ -349,8 +352,8 @@ def integration_devices() -> Dict[str, Any]:
                 "event_sources": _network_event_sources("client", client_ref),
                 "status": _network_status(client),
                 "state": _network_status(client),
-                "room": site_name,
-                "area": site_name,
+                "room": UNIFI_NETWORK_DEFAULT_ROOM,
+                "area": UNIFI_NETWORK_DEFAULT_ROOM,
                 "details": details,
             }
         )
