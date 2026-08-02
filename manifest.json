@@ -41,9 +41,9 @@
       "id": "homeassistant",
       "name": "Home Assistant",
       "description": "Shared Home Assistant endpoint and token for portals, verbas, and announcement paths.",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "entry": "integrations/homeassistant.py",
-      "sha256": "fdfa1c6f6fc7d7d56c635781fa46c6cdec604bfb8c6ec7b99abe05bbc027b5c5",
+      "sha256": "d7061533a4231106629b71c4363324bac2f9dcd73af7ce106d2aa40ab5a91965",
       "required": false,
       "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "cover", "climate", "media_player", "remote", "scene", "script"]
     },
