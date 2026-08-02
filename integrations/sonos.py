@@ -1,12 +1,14 @@
 from __future__ import annotations
-__version__ = "1.2.4"
+__version__ = "1.3.0"
 
 import contextlib
 import html
 import json
 import socket
 import ssl
+import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -36,6 +38,9 @@ SONOS_AUDIOCLIP_API_KEY = "123e4567-e89b-12d3-a456-426655440000"
 SONOS_AUDIOCLIP_SUBPROTOCOL = "v1.api.smartspeaker.audio"
 SONOS_AUDIOCLIP_APP_ID = "com.tatertotterson.tater"
 SONOS_AUDIOCLIP_NAME = "Tater Announcement"
+
+_sonos_music_groups_lock = threading.RLock()
+_sonos_music_groups: Dict[str, Dict[str, Any]] = {}
 
 INTEGRATION = {
     "id": "sonos",
@@ -522,6 +527,16 @@ def _sonos_seek(root_url: str, rel_time: Any, *, timeout_s: float) -> None:
     )
 
 
+def _sonos_rel_time(seconds: Any) -> str:
+    try:
+        total = max(0, int(round(float(seconds))))
+    except Exception:
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _sonos_play(root_url: str, *, timeout_s: float) -> None:
     _sonos_soap_action(
         root_url,
@@ -699,7 +714,7 @@ def _sonos_play_audio_clip_targets_sync(
     raise RuntimeError("; ".join(failures) or "Sonos audio clip failed.")
 
 
-def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: float) -> None:
+def _sonos_set_transport_uri(root_url: str, source_url: Any, *, timeout_s: float) -> None:
     url = _text(source_url)
     if not root_url:
         raise RuntimeError("Sonos speaker root URL is missing.")
@@ -716,6 +731,10 @@ def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: f
         ),
         timeout_s=timeout_s,
     )
+
+
+def _sonos_replace_transport_uri(root_url: str, source_url: Any, *, timeout_s: float) -> None:
+    _sonos_set_transport_uri(root_url, source_url, timeout_s=timeout_s)
     _sonos_play(root_url, timeout_s=timeout_s)
 
 
@@ -726,9 +745,16 @@ def _sonos_play_transport_with_restore(
     timeout_s: float,
     restore_after: bool = True,
     restore_wait_s: Optional[float] = None,
+    start_position_seconds: float = 0.0,
 ) -> None:
     snapshot = _sonos_snapshot_player(root_url, timeout_s=timeout_s) if restore_after else {}
     _sonos_replace_transport_uri(root_url, source_url, timeout_s=timeout_s)
+    if float(start_position_seconds or 0.0) > 0.0:
+        _sonos_seek(
+            root_url,
+            _sonos_rel_time(start_position_seconds),
+            timeout_s=timeout_s,
+        )
     if not restore_after:
         return
     wait_s = restore_wait_s if restore_wait_s is not None else timeout_s
@@ -1200,6 +1226,7 @@ def sonos_play_url_sync(
     restore_after: bool = True,
     restore_wait_s: Optional[float] = None,
     prefer_audio_clip: bool = True,
+    start_position_seconds: float = 0.0,
 ) -> None:
     root_url = _text(speaker.get("root_url")) if isinstance(speaker, dict) else ""
     url = _text(source_url)
@@ -1231,7 +1258,201 @@ def sonos_play_url_sync(
         timeout_s=timeout_s,
         restore_after=restore_after,
         restore_wait_s=restore_wait_s,
+        start_position_seconds=start_position_seconds,
     )
+
+
+def _sonos_music_target_id(speaker: Dict[str, Any]) -> str:
+    return (
+        sonos_target_id(speaker.get("coordinator_id"))
+        or sonos_target_id(speaker.get("id"))
+        or sonos_target_id(speaker.get("udn"))
+    )
+
+
+def _sonos_become_standalone(root_url: str, *, timeout_s: float) -> None:
+    _sonos_soap_action(
+        root_url,
+        action="BecomeCoordinatorOfStandaloneGroup",
+        inner_xml="<InstanceID>0</InstanceID>",
+        timeout_s=timeout_s,
+    )
+
+
+def _sonos_group_session_for_target(target_id: Any) -> tuple[str, Dict[str, Any]]:
+    token = sonos_target_id(target_id)
+    if not token:
+        return "", {}
+    with _sonos_music_groups_lock:
+        for session_id, row in _sonos_music_groups.items():
+            target_ids = set(row.get("target_ids") or []) if isinstance(row, dict) else set()
+            if token in target_ids:
+                return session_id, dict(row)
+    return "", {}
+
+
+def _restore_sonos_music_group(session_id: str, *, timeout_s: float) -> List[str]:
+    with _sonos_music_groups_lock:
+        session = _sonos_music_groups.pop(_text(session_id), None)
+    if not isinstance(session, dict):
+        return []
+    failures: List[str] = []
+    for row in reversed(list(session.get("joined") or [])):
+        if not isinstance(row, dict):
+            continue
+        root_url = _text(row.get("root_url"))
+        target_id = sonos_target_id(row.get("target_id"))
+        original_uri = _text(row.get("original_uri"))
+        try:
+            if original_uri.lower().startswith("x-rincon:"):
+                _sonos_set_transport_uri(root_url, original_uri, timeout_s=timeout_s)
+            else:
+                _sonos_become_standalone(root_url, timeout_s=timeout_s)
+        except Exception as exc:
+            failures.append(f"{target_id or root_url} ({exc})")
+    return failures
+
+
+def _restore_sonos_music_groups_for_targets(target_ids: List[str], *, timeout_s: float) -> List[str]:
+    wanted = {sonos_target_id(value) for value in list(target_ids or []) if sonos_target_id(value)}
+    session_ids: List[str] = []
+    with _sonos_music_groups_lock:
+        for session_id, row in _sonos_music_groups.items():
+            if wanted.intersection(set(row.get("target_ids") or [])):
+                session_ids.append(session_id)
+    failures: List[str] = []
+    for session_id in session_ids:
+        failures.extend(_restore_sonos_music_group(session_id, timeout_s=timeout_s))
+    return failures
+
+
+def _sonos_play_group_sync(
+    *,
+    speakers: List[Dict[str, Any]],
+    source_url: str,
+    timeout_s: float,
+    start_position_seconds: float,
+    volume_percent: Any = None,
+) -> Dict[str, Any]:
+    resolved: List[Dict[str, Any]] = []
+    target_ids: List[str] = []
+    for speaker in list(speakers or []):
+        target_id = _sonos_music_target_id(speaker)
+        root_url = normalize_sonos_root(speaker.get("root_url"))
+        if not target_id or not root_url or target_id in target_ids:
+            continue
+        target_ids.append(target_id)
+        resolved.append({**dict(speaker), "target_id": target_id, "root_url": root_url})
+    if not resolved:
+        raise RuntimeError("No Sonos group members were available.")
+
+    restore_warnings = _restore_sonos_music_groups_for_targets(target_ids, timeout_s=timeout_s)
+    leader = resolved[0]
+    leader_id = _text(leader.get("target_id"))
+    joined: List[Dict[str, Any]] = []
+    try:
+        if volume_percent is not None:
+            for member in resolved:
+                _sonos_set_volume(member["root_url"], volume_percent, timeout_s=timeout_s)
+        for follower in resolved[1:]:
+            snapshot = _sonos_snapshot_player(follower["root_url"], timeout_s=timeout_s)
+            original_uri = _sonos_snapshot_uri(snapshot)
+            wanted_uri = f"x-rincon:{leader_id}"
+            if original_uri.lower() != wanted_uri.lower():
+                _sonos_set_transport_uri(follower["root_url"], wanted_uri, timeout_s=timeout_s)
+                joined.append(
+                    {
+                        "target_id": follower["target_id"],
+                        "root_url": follower["root_url"],
+                        "original_uri": original_uri,
+                    }
+                )
+        sonos_play_url_sync(
+            speaker=leader,
+            source_url=source_url,
+            timeout_s=timeout_s,
+            restore_after=False,
+            prefer_audio_clip=False,
+            start_position_seconds=start_position_seconds,
+        )
+    except Exception:
+        rollback_id = uuid.uuid4().hex
+        with _sonos_music_groups_lock:
+            _sonos_music_groups[rollback_id] = {"target_ids": target_ids, "joined": joined}
+        _restore_sonos_music_group(rollback_id, timeout_s=timeout_s)
+        raise
+
+    session_id = uuid.uuid4().hex
+    session = {
+        "session_id": session_id,
+        "leader_id": leader_id,
+        "leader_root_url": leader["root_url"],
+        "target_ids": target_ids,
+        "joined": joined,
+        "created_at": time.time(),
+    }
+    with _sonos_music_groups_lock:
+        _sonos_music_groups[session_id] = dict(session)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "sent_count": len(resolved),
+        "group": {
+            "session_id": session_id,
+            "leader_id": leader_id,
+            "target_ids": target_ids,
+            "joined_count": len(joined),
+        },
+    }
+    if restore_warnings:
+        result["warnings"] = restore_warnings
+    return result
+
+
+def sonos_stop_media_sync(
+    *,
+    speakers: List[str],
+    timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    clean_speakers = [sonos_target_id(item) for item in list(speakers or []) if sonos_target_id(item)]
+    session_ids: List[str] = []
+    sessions: List[Dict[str, Any]] = []
+    with _sonos_music_groups_lock:
+        for session_id, row in _sonos_music_groups.items():
+            if set(clean_speakers).intersection(set(row.get("target_ids") or [])):
+                session_ids.append(session_id)
+                sessions.append(dict(row))
+    failures: List[str] = []
+    stopped: set[str] = set()
+    for session_id, session in zip(session_ids, sessions):
+        leader_root = _text(session.get("leader_root_url"))
+        leader_id = sonos_target_id(session.get("leader_id"))
+        try:
+            _sonos_stop(leader_root, timeout_s=timeout_s)
+            if leader_id:
+                stopped.add(leader_id)
+        except Exception as exc:
+            failures.append(f"{leader_id or leader_root} ({exc})")
+        failures.extend(_restore_sonos_music_group(session_id, timeout_s=timeout_s))
+        stopped.update(sonos_target_id(value) for value in session.get("target_ids") or [])
+
+    for target in clean_speakers:
+        if target in stopped:
+            continue
+        try:
+            speaker = resolve_sonos_target(target)
+            if not speaker:
+                raise RuntimeError("speaker was not found")
+            _sonos_stop(_text(speaker.get("root_url")), timeout_s=timeout_s)
+            stopped.add(target)
+        except Exception as exc:
+            failures.append(f"{target} ({exc})")
+    result: Dict[str, Any] = {"ok": bool(stopped), "sent_count": len(stopped)}
+    if failures:
+        if stopped:
+            result["warnings"] = failures
+        else:
+            result["error"] = "; ".join(failures)
+    return result
 
 
 def sonos_play_media_sync(
@@ -1242,6 +1463,8 @@ def sonos_play_media_sync(
     timeout_s: float = SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS,
     restore_after: bool = True,
     restore_wait_s: Optional[float] = None,
+    start_position_seconds: float = 0.0,
+    volume_percent: Any = None,
 ) -> Dict[str, Any]:
     clean_speakers = [sonos_target_id(item) for item in list(speakers or []) if sonos_target_id(item)]
     if not clean_speakers:
@@ -1252,13 +1475,45 @@ def sonos_play_media_sync(
     media_kind = _text(media_content_type).lower()
     prefer_audio_clip = media_kind not in {"music", "audio", "song", "media"}
 
+    if not prefer_audio_clip and len(clean_speakers) > 1:
+        resolved: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        for target in clean_speakers:
+            try:
+                speaker = resolve_sonos_target(target)
+                if not speaker:
+                    raise RuntimeError("speaker was not found")
+                resolved.append(speaker)
+            except Exception as exc:
+                failures.append(f"{target} ({exc})")
+        if not resolved:
+            return {"ok": False, "sent_count": 0, "error": "; ".join(failures) or "Sonos playback failed."}
+        try:
+            result = _sonos_play_group_sync(
+                speakers=resolved,
+                source_url=url,
+                timeout_s=timeout_s,
+                start_position_seconds=start_position_seconds,
+                volume_percent=volume_percent,
+            )
+            if failures:
+                result.setdefault("warnings", []).extend(failures)
+            return result
+        except Exception as exc:
+            failures.append(str(exc))
+            return {"ok": False, "sent_count": 0, "error": "; ".join(failures)}
+
     sent_count = 0
     failures: List[str] = []
+    if not prefer_audio_clip:
+        failures.extend(_restore_sonos_music_groups_for_targets(clean_speakers, timeout_s=timeout_s))
     for target in clean_speakers:
         try:
             speaker = resolve_sonos_target(target)
             if not speaker:
                 raise RuntimeError("speaker was not found")
+            if volume_percent is not None:
+                _sonos_set_volume(_text(speaker.get("root_url")), volume_percent, timeout_s=timeout_s)
             sonos_play_url_sync(
                 speaker=speaker,
                 source_url=url,
@@ -1266,6 +1521,7 @@ def sonos_play_media_sync(
                 restore_after=restore_after,
                 restore_wait_s=restore_wait_s,
                 prefer_audio_clip=prefer_audio_clip,
+                start_position_seconds=start_position_seconds,
             )
             sent_count += 1
         except Exception as exc:
@@ -1316,9 +1572,17 @@ def integration_devices() -> Dict[str, Any]:
                 "name": _text(speaker.get("display_name")) or _text(speaker.get("name")) or _text(speaker.get("host")) or "Sonos Speaker",
                 "type": "speaker",
                 "ref": f"speaker:{speaker_id}" if speaker_id else "",
-                "capabilities": ["speaker", "media_player", "audio_output", "announcement_target", "play_media"],
-                "actions": ["play_media", "play_url", "announce"],
-                "features": ["announcement", "play_media", "speaker"],
+                "capabilities": [
+                    "speaker",
+                    "media_player",
+                    "audio_output",
+                    "announcement_target",
+                    "play_media",
+                    "volume",
+                    "seek",
+                ],
+                "actions": ["play_media", "play_url", "announce", "set_volume", "seek", "stop"],
+                "features": ["announcement", "play_media", "speaker", "volume", "seek"],
                 "status": "available",
                 "state": "available",
                 "room": room,
@@ -1371,13 +1635,46 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
 
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     action = _text(action_id).lower()
-    if action not in {"play_media", "play_url", "announce"}:
+    if action not in {"play_media", "play_url", "announce", "set_volume", "seek", "stop"}:
         raise KeyError(f"Unsupported Sonos device action: {action_id}")
+    speaker = resolve_sonos_target(device_id)
+    if not speaker:
+        raise RuntimeError("Sonos speaker was not found.")
+    root_url = _text(speaker.get("root_url"))
+    timeout_s = float((payload or {}).get("timeout_s") or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS)
+    if action == "set_volume":
+        _sonos_set_volume(
+            root_url,
+            (payload or {}).get("volume_percent", (payload or {}).get("volume")),
+            timeout_s=timeout_s,
+        )
+        return {"ok": True, "device_id": sonos_target_id(device_id), "action": action}
+    if action == "seek":
+        seconds = float(
+            (payload or {}).get("position_seconds")
+            or (payload or {}).get("start_position_seconds")
+            or 0.0
+        )
+        _session_id, group_session = _sonos_group_session_for_target(device_id)
+        seek_root = _text(group_session.get("leader_root_url")) or root_url
+        _sonos_seek(seek_root, _sonos_rel_time(seconds), timeout_s=timeout_s)
+        return {"ok": True, "device_id": sonos_target_id(device_id), "action": action}
+    if action == "stop":
+        result = sonos_stop_media_sync(speakers=[device_id], timeout_s=timeout_s)
+        result.setdefault("device_id", sonos_target_id(device_id))
+        result.setdefault("action", action)
+        return result
     source_url = _text((payload or {}).get("source_url") or (payload or {}).get("url") or (payload or {}).get("media_url"))
     if not source_url:
         raise ValueError("Sonos device action requires source_url.")
-    timeout_s = float((payload or {}).get("timeout_s") or SONOS_DEFAULT_PLAY_TIMEOUT_SECONDS)
-    result = sonos_play_media_sync(speakers=[device_id], source_url=source_url, timeout_s=timeout_s)
+    result = sonos_play_media_sync(
+        speakers=[device_id],
+        source_url=source_url,
+        timeout_s=timeout_s,
+        restore_after=action == "announce",
+        start_position_seconds=float((payload or {}).get("start_position_seconds") or 0.0),
+        volume_percent=(payload or {}).get("volume_percent", (payload or {}).get("volume")),
+    )
     result.setdefault("ok", bool(result.get("sent_count")))
     result.setdefault("device_id", sonos_target_id(device_id))
     result.setdefault("action", action)
