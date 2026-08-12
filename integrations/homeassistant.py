@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 import asyncio
 import io
@@ -324,6 +324,7 @@ def _homeassistant_entity_details(row: Dict[str, Any]) -> Dict[str, Any]:
         "unit_of_measurement",
         "device_class",
         "state_class",
+        "options",
         "battery_level",
         "last_changed",
         "last_updated",
@@ -336,6 +337,112 @@ def _homeassistant_entity_details(row: Dict[str, Any]) -> Dict[str, Any]:
         if value not in (None, ""):
             details[key] = value
     return details
+
+
+def _homeassistant_state_options(attrs: Dict[str, Any]) -> list[str]:
+    raw = attrs.get("options")
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        token = _text(value)
+        folded = token.casefold()
+        if not token or folded in seen:
+            continue
+        seen.add(folded)
+        out.append(token)
+    return out
+
+
+def _homeassistant_state_is_numeric(state: Any, attrs: Dict[str, Any]) -> bool:
+    if _text(attrs.get("unit_of_measurement")):
+        return True
+    if _text(state).lower() in {"", "unknown", "unavailable", "none"}:
+        return False
+    try:
+        float(state)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _homeassistant_entity_event_sources(
+    entity_id: str,
+    state: Any,
+    attrs: Dict[str, Any],
+) -> list[Dict[str, Any]]:
+    domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
+    device_class = _text(attrs.get("device_class")).lower()
+    source_type = ""
+    trigger_events: list[str] = []
+    state_on = ""
+    state_off = ""
+
+    if domain == "binary_sensor":
+        source_type = device_class or "binary"
+        state_on, state_off = "on", "off"
+        if device_class == "motion":
+            trigger_events = ["motion"]
+        elif device_class in {"door", "window", "opening", "garage_door"}:
+            trigger_events = ["opens", "closes"]
+        elif device_class == "connectivity":
+            trigger_events = ["connects", "disconnects"]
+        else:
+            trigger_events = ["turns_on", "turns_off"]
+    elif domain in {"switch", "input_boolean", "light", "fan", "automation"}:
+        source_type = domain
+        trigger_events = ["turns_on", "turns_off"]
+        state_on, state_off = "on", "off"
+    elif domain == "cover":
+        source_type = device_class or "cover"
+        trigger_events = ["opens", "closes"]
+        state_on, state_off = "open", "closed"
+    elif domain == "sensor":
+        if _homeassistant_state_is_numeric(state, attrs):
+            source_type = device_class or "measurement"
+            trigger_events = ["changed", "above", "below"]
+        else:
+            source_type = device_class or "state"
+            trigger_events = ["changed", "equals"]
+    elif domain in {"select", "input_select"}:
+        source_type = "state"
+        trigger_events = ["changed", "equals"]
+    elif domain in {
+        "alarm_control_panel",
+        "climate",
+        "device_tracker",
+        "humidifier",
+        "lock",
+        "media_player",
+        "person",
+        "vacuum",
+        "water_heater",
+    }:
+        source_type = domain
+        trigger_events = ["changed", "equals"]
+    elif domain == "event":
+        source_type = "event"
+        trigger_events = ["changed"]
+
+    if not source_type or not trigger_events:
+        return []
+    source: Dict[str, Any] = {
+        "type": source_type,
+        "ref": entity_id,
+        "trigger_events": trigger_events,
+    }
+    if state_on:
+        source["state_on"] = state_on
+    if state_off:
+        source["state_off"] = state_off
+    state_options = _homeassistant_state_options(attrs)
+    if state_options:
+        source["state_options"] = state_options
+    unit = _text(attrs.get("unit_of_measurement"))
+    if unit:
+        source["unit"] = unit
+    return [source]
 
 
 def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) -> list[str]:
@@ -544,6 +651,7 @@ def integration_devices() -> Dict[str, Any]:
                 "capabilities": capabilities,
                 "actions": actions,
                 "features": actions,
+                "event_sources": _homeassistant_entity_event_sources(entity_id, state, attrs),
                 "room": room,
                 "area": room,
                 "state": state,
