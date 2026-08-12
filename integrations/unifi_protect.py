@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import base64
 import contextlib
@@ -51,6 +51,7 @@ INTEGRATION = {
     "order": 70,
     "capabilities": [
         "camera",
+        "doorbell",
         "motion",
         "entry_sensor",
         "temperature",
@@ -423,6 +424,13 @@ def _sensor_stat_value(row: Dict[str, Any], stat: str) -> Any:
 
 
 def _unifi_camera_is_doorbell(row: Dict[str, Any]) -> bool:
+    for key in ("isDoorbell", "is_doorbell", "hasDoorbell", "has_doorbell"):
+        if _bool_value(row.get(key)) is True:
+            return True
+    feature_flags = row.get("featureFlags") if isinstance(row.get("featureFlags"), dict) else {}
+    for key in ("isDoorbell", "is_doorbell", "hasDoorbell", "has_doorbell", "hasChime", "has_chime"):
+        if _bool_value(feature_flags.get(key)) is True:
+            return True
     hint = " ".join(
         _text(row.get(key)).lower()
         for key in ("name", "type", "model", "modelKey", "marketName", "market_name")
@@ -750,6 +758,8 @@ def integration_devices() -> Dict[str, Any]:
                 "features": [
                     "snapshot",
                     "motion",
+                    *_unifi_camera_smart_detect_types(camera),
+                    *(("doorbell",) if _unifi_camera_is_doorbell(camera) else ()),
                     *(("speaker", "announcement") if unifi_camera_has_speaker_hint(camera) else ()),
                 ],
                 "event_sources": _unifi_camera_event_sources(camera_id, camera),

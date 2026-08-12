@@ -148,11 +148,11 @@
       "id": "unifi_protect",
       "name": "UniFi Protect",
       "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "entry": "integrations/unifi_protect.py",
-      "sha256": "44d5ad9e52852be2c320d0824631a53a49322ec2004e0ba310c2d09c731d299a",
+      "sha256": "af24b731ae72210d1dd793a147263e1fd7525632a8032bbb23709f266598d092",
       "required": false,
-      "capabilities": ["camera", "motion", "entry_sensor", "temperature", "humidity", "illuminance", "leak", "battery", "speaker"]
+      "capabilities": ["camera", "doorbell", "motion", "entry_sensor", "temperature", "humidity", "illuminance", "leak", "battery", "speaker"]
     },
     {
       "id": "weather_api",
