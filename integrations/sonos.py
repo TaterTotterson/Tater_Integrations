@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import contextlib
 import html
@@ -1333,6 +1333,7 @@ def _sonos_play_group_sync(
     timeout_s: float,
     start_position_seconds: float,
     volume_percent: Any = None,
+    volume_by_speaker: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     resolved: List[Dict[str, Any]] = []
     target_ids: List[str] = []
@@ -1351,9 +1352,15 @@ def _sonos_play_group_sync(
     leader_id = _text(leader.get("target_id"))
     joined: List[Dict[str, Any]] = []
     try:
-        if volume_percent is not None:
+        if volume_percent is not None or volume_by_speaker:
             for member in resolved:
-                _sonos_set_volume(member["root_url"], volume_percent, timeout_s=timeout_s)
+                member_volume = (
+                    volume_by_speaker.get(member["target_id"], volume_percent)
+                    if isinstance(volume_by_speaker, dict)
+                    else volume_percent
+                )
+                if member_volume is not None:
+                    _sonos_set_volume(member["root_url"], member_volume, timeout_s=timeout_s)
         for follower in resolved[1:]:
             snapshot = _sonos_snapshot_player(follower["root_url"], timeout_s=timeout_s)
             original_uri = _sonos_snapshot_uri(snapshot)
@@ -1465,6 +1472,7 @@ def sonos_play_media_sync(
     restore_wait_s: Optional[float] = None,
     start_position_seconds: float = 0.0,
     volume_percent: Any = None,
+    volume_by_speaker: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     clean_speakers = [sonos_target_id(item) for item in list(speakers or []) if sonos_target_id(item)]
     if not clean_speakers:
@@ -1495,6 +1503,7 @@ def sonos_play_media_sync(
                 timeout_s=timeout_s,
                 start_position_seconds=start_position_seconds,
                 volume_percent=volume_percent,
+                volume_by_speaker=volume_by_speaker,
             )
             if failures:
                 result.setdefault("warnings", []).extend(failures)
@@ -1512,8 +1521,13 @@ def sonos_play_media_sync(
             speaker = resolve_sonos_target(target)
             if not speaker:
                 raise RuntimeError("speaker was not found")
-            if volume_percent is not None:
-                _sonos_set_volume(_text(speaker.get("root_url")), volume_percent, timeout_s=timeout_s)
+            speaker_volume = (
+                volume_by_speaker.get(target, volume_percent)
+                if isinstance(volume_by_speaker, dict)
+                else volume_percent
+            )
+            if speaker_volume is not None:
+                _sonos_set_volume(_text(speaker.get("root_url")), speaker_volume, timeout_s=timeout_s)
             sonos_play_url_sync(
                 speaker=speaker,
                 source_url=url,

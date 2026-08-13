@@ -116,9 +116,9 @@
       "id": "sonos",
       "name": "Sonos",
       "description": "Sonos speaker discovery and direct playback targets for announcements and music.",
-      "version": "1.3.0",
+      "version": "1.3.1",
       "entry": "integrations/sonos.py",
-      "sha256": "dee1b3d0c1fc2d23227ccdd484a4ea05e12a4d3f210fc0585d0c05a25cb33e26",
+      "sha256": "6aa757446b52e2261a2cf6a9259253ebff6fbaa35e066f4f692e68f1d8fb73a5",
       "required": false,
       "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"]
     },
