@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,237 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
         row = {"name": "Front Entry", "featureFlags": {"hasChime": True}}
 
         self.assertTrue(unifi_protect._unifi_camera_is_doorbell(row))
+
+    def test_talkback_profile_matches_unifi_codec_container(self) -> None:
+        cases = (
+            ("aac", "aac", "adts"),
+            ("opus", "libopus", "rtp"),
+            ("vorbis", "libvorbis", "ogg"),
+        )
+        for codec, encoder, output_format in cases:
+            with self.subTest(codec=codec):
+                profile = unifi_protect._talkback_audio_profile(
+                    {
+                        "codec": codec,
+                        "samplingRate": 24000,
+                        "bitsPerSample": 16,
+                    }
+                )
+                self.assertEqual(profile["encoder"], encoder)
+                self.assertEqual(profile["output_format"], output_format)
+                self.assertEqual(profile["sample_rate"], 24000)
+                self.assertEqual(profile["bits_per_sample"], 16)
+
+    def test_talkback_profile_rejects_unknown_codec(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported UniFi Protect talkback codec"):
+            unifi_protect._talkback_audio_profile({"codec": "mystery"})
+
+    def test_playback_uses_session_codec_container_and_realtime_pacing(self) -> None:
+        session = {
+            "url": "udp://192.0.2.10:7004",
+            "codec": "aac",
+            "samplingRate": 24000,
+            "bitsPerSample": 16,
+        }
+        completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={
+                    "base": "https://protect.local",
+                    "api_key": "key",
+                    "username": "",
+                    "password": "",
+                    "announcement_volume": "100",
+                },
+            ),
+            patch.object(unifi_protect, "unifi_protect_request", return_value=session),
+            patch.object(unifi_protect.shutil, "which", return_value="/usr/bin/ffmpeg"),
+            patch.object(unifi_protect.subprocess, "run", return_value=completed) as run,
+        ):
+            result = unifi_protect.play_unifi_protect_audio_sync(
+                cameras=["front-door"],
+                audio_bytes=b"test audio",
+            )
+
+        self.assertTrue(result["ok"])
+        command = run.call_args.args[0]
+        self.assertIn("-re", command)
+        self.assertIn("aac", command)
+        self.assertEqual(command[command.index("-f") + 1], "adts")
+        self.assertEqual(command[-1], session["url"])
+
+    def test_announcement_volume_is_boosted_restored_and_does_not_change_ring(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.camera = {
+                    "speakerSettings": {
+                        "speakerVolume": 35,
+                        "ringVolume": 62,
+                    }
+                }
+                self.volume_changes = []
+                self.closed = False
+
+            def login(self) -> None:
+                pass
+
+            def get_camera(self, camera_id: str):
+                self.assert_camera_id = camera_id
+                return self.camera
+
+            def set_speaker_volume(self, camera_id: str, level: int) -> None:
+                self.volume_changes.append((camera_id, level))
+                self.camera["speakerSettings"]["speakerVolume"] = level
+
+            def close(self) -> None:
+                self.closed = True
+
+        client = FakeClient()
+        settings = {
+            "base": "https://protect.local",
+            "api_key": "key",
+            "username": "tater-local",
+            "password": "secret",
+            "announcement_volume": "100",
+        }
+        with (
+            patch.object(unifi_protect, "read_unifi_protect_settings", return_value=settings),
+            patch.object(unifi_protect, "_private_protect_client", return_value=client),
+            patch.object(unifi_protect.shutil, "which", return_value="/usr/bin/ffmpeg"),
+            patch.object(
+                unifi_protect,
+                "_play_unifi_camera_audio_sync",
+                return_value={"ok": True},
+            ),
+        ):
+            result = unifi_protect.play_unifi_protect_audio_sync(
+                cameras=["front-door"],
+                audio_bytes=b"test audio",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.volume_changes, [("front-door", 100), ("front-door", 35)])
+        self.assertEqual(client.camera["speakerSettings"]["ringVolume"], 62)
+        self.assertTrue(client.closed)
+
+    def test_announcement_volume_is_restored_when_playback_fails(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.camera = {
+                    "speakerSettings": {
+                        "speakerVolume": 40,
+                        "ringVolume": 70,
+                    }
+                }
+                self.volume_changes = []
+
+            def login(self) -> None:
+                pass
+
+            def get_camera(self, camera_id: str):
+                return self.camera
+
+            def set_speaker_volume(self, camera_id: str, level: int) -> None:
+                self.volume_changes.append((camera_id, level))
+                self.camera["speakerSettings"]["speakerVolume"] = level
+
+            def close(self) -> None:
+                pass
+
+        client = FakeClient()
+        with (
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={
+                    "base": "https://protect.local",
+                    "api_key": "key",
+                    "username": "tater-local",
+                    "password": "secret",
+                    "announcement_volume": "100",
+                },
+            ),
+            patch.object(unifi_protect, "_private_protect_client", return_value=client),
+            patch.object(unifi_protect.shutil, "which", return_value="/usr/bin/ffmpeg"),
+            patch.object(
+                unifi_protect,
+                "_play_unifi_camera_audio_sync",
+                return_value={"ok": False, "error": "stream failed"},
+            ),
+        ):
+            result = unifi_protect.play_unifi_protect_audio_sync(
+                cameras=["front-door"],
+                audio_bytes=b"test audio",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(client.volume_changes, [("front-door", 100), ("front-door", 40)])
+        self.assertEqual(client.camera["speakerSettings"]["ringVolume"], 70)
+
+    def test_private_client_uses_local_login_and_only_patches_speaker_volume(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"x-csrf-token": "csrf-token"}
+            content = b"{}"
+
+            def json(self):
+                return {}
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = []
+                self.closed = False
+
+            def request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                return FakeResponse()
+
+            def close(self) -> None:
+                self.closed = True
+
+        session = FakeSession()
+        with patch.object(unifi_protect.requests, "Session", return_value=session, create=True):
+            client = unifi_protect._private_protect_client(
+                {
+                    "base_url": "https://protect.local:443",
+                    "username": "tater-local",
+                    "password": "secret",
+                }
+            )
+            client.login()
+            client.set_speaker_volume("front-door", 100)
+            client.close()
+
+        login = session.calls[0]
+        self.assertEqual(login[0], "POST")
+        self.assertEqual(login[1], "https://protect.local:443/api/auth/login")
+        self.assertEqual(
+            login[2]["json"],
+            {"username": "tater-local", "password": "secret", "rememberMe": False},
+        )
+        volume_patch = session.calls[1]
+        self.assertEqual(volume_patch[0], "PATCH")
+        self.assertEqual(
+            volume_patch[2]["json"],
+            {"speakerSettings": {"speakerVolume": 100}},
+        )
+        self.assertNotIn("ringVolume", str(volume_patch[2]["json"]))
+        self.assertEqual(volume_patch[2]["headers"]["X-CSRF-Token"], "csrf-token")
+        self.assertTrue(session.closed)
+
+    def test_private_volume_login_upgrades_standard_http_console_to_https(self) -> None:
+        config = unifi_protect._private_volume_config(
+            {
+                "base": "http://10.4.20.127",
+                "username": "tater",
+                "password": "secret",
+                "announcement_volume": "100",
+            }
+        )
+
+        self.assertEqual(config["base_url"], "https://10.4.20.127:443")
 
 
 if __name__ == "__main__":

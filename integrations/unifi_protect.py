@@ -1,19 +1,22 @@
 from __future__ import annotations
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 import base64
 import contextlib
 import io
 import json
+import logging
 import mimetypes
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 import wave
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -21,9 +24,15 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from helpers import redis_client
 from vision_settings import get_vision_settings as get_shared_vision_settings
 
+logger = logging.getLogger(__name__)
+
 UNIFI_PROTECT_BASE_URL_KEY = "tater:unifi_protect:base_url"
 UNIFI_PROTECT_API_KEY_KEY = "tater:unifi_protect:api_key"
+UNIFI_PROTECT_USERNAME_KEY = "tater:unifi_protect:username"
+UNIFI_PROTECT_PASSWORD_KEY = "tater:unifi_protect:password"
+UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY = "tater:unifi_protect:announcement_volume"
 UNIFI_PROTECT_DEFAULT_BASE_URL = "https://10.4.20.127"
+UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME = 100
 DEFAULT_UNIFI_PROTECT_AUDIO_TIMEOUT_SECONDS = 90.0
 INTEGRATION_RUNTIME_POLL_SECONDS = 2
 UNIFI_PROTECT_CAMERA_PATHS = [
@@ -36,6 +45,8 @@ UNIFI_PROTECT_SENSOR_PATHS = [
     "/proxy/protect/api/sensors",
     "/proxy/protect/api/bootstrap",
 ]
+_announcement_lock_guard = threading.Lock()
+_announcement_locks: Dict[str, threading.Lock] = {}
 
 
 def _subprocess_spawn_kwargs() -> Dict[str, Any]:
@@ -75,6 +86,34 @@ INTEGRATION = {
             "type": "password",
             "default": "",
         },
+        {
+            "key": "unifi_protect_username",
+            "label": "Local Protect Username",
+            "type": "text",
+            "default": "",
+            "description": (
+                "Optional local-only Protect account used to raise announcement volume. "
+                "Use a least-privileged local account, not a UI.com owner account."
+            ),
+        },
+        {
+            "key": "unifi_protect_password",
+            "label": "Local Protect Password",
+            "type": "password",
+            "default": "",
+            "description": "Required with the local username for temporary speaker-volume control.",
+        },
+        {
+            "key": "unifi_protect_announcement_volume",
+            "label": "Announcement Volume",
+            "type": "number",
+            "default": UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+            "min": 0,
+            "max": 100,
+            "description": (
+                "Temporarily used for TTS, then restored. The normal doorbell ring volume is never changed."
+            ),
+        },
     ],
     "actions": [
         {
@@ -106,9 +145,20 @@ def read_unifi_protect_settings(client: Any = None) -> Dict[str, str]:
     store = client or redis_client
     base = _text(store.get(UNIFI_PROTECT_BASE_URL_KEY) or UNIFI_PROTECT_DEFAULT_BASE_URL).rstrip("/")
     api_key = _text(store.get(UNIFI_PROTECT_API_KEY_KEY))
+    username = _text(store.get(UNIFI_PROTECT_USERNAME_KEY))
+    password = _text(store.get(UNIFI_PROTECT_PASSWORD_KEY))
+    announcement_volume = _as_int(
+        store.get(UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY),
+        UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+        minimum=0,
+        maximum=100,
+    )
     return {
         "base": base or UNIFI_PROTECT_DEFAULT_BASE_URL,
         "api_key": api_key,
+        "username": username,
+        "password": password,
+        "announcement_volume": str(announcement_volume),
         "UNIFI_PROTECT_BASE_URL": base or UNIFI_PROTECT_DEFAULT_BASE_URL,
         "UNIFI_PROTECT_API_KEY": api_key,
     }
@@ -118,14 +168,28 @@ def save_unifi_protect_settings(
     *,
     base_url: Any = None,
     api_key: Any = None,
+    username: Any = None,
+    password: Any = None,
+    announcement_volume: Any = None,
     client: Any = None,
 ) -> Dict[str, str]:
     store = client or redis_client
     current = read_unifi_protect_settings(store)
     next_base = _text(current.get("base") if base_url is None else base_url) or UNIFI_PROTECT_DEFAULT_BASE_URL
     next_api_key = _text(current.get("api_key") if api_key is None else api_key)
+    next_username = _text(current.get("username") if username is None else username)
+    next_password = _text(current.get("password") if password is None else password)
+    next_announcement_volume = _as_int(
+        current.get("announcement_volume") if announcement_volume is None else announcement_volume,
+        UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+        minimum=0,
+        maximum=100,
+    )
     store.set(UNIFI_PROTECT_BASE_URL_KEY, next_base.rstrip("/"))
     store.set(UNIFI_PROTECT_API_KEY_KEY, next_api_key)
+    store.set(UNIFI_PROTECT_USERNAME_KEY, next_username)
+    store.set(UNIFI_PROTECT_PASSWORD_KEY, next_password)
+    store.set(UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY, str(next_announcement_volume))
     return read_unifi_protect_settings(store)
 
 
@@ -843,6 +907,14 @@ def read_integration_settings() -> Dict[str, Any]:
     return {
         "unifi_protect_base_url": settings.get("base") or UNIFI_PROTECT_DEFAULT_BASE_URL,
         "unifi_protect_api_key": settings.get("api_key", ""),
+        "unifi_protect_username": settings.get("username", ""),
+        "unifi_protect_password": settings.get("password", ""),
+        "unifi_protect_announcement_volume": _as_int(
+            settings.get("announcement_volume"),
+            UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+            minimum=0,
+            maximum=100,
+        ),
     }
 
 
@@ -850,10 +922,21 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     saved = save_unifi_protect_settings(
         base_url=(payload or {}).get("unifi_protect_base_url"),
         api_key=(payload or {}).get("unifi_protect_api_key"),
+        username=(payload or {}).get("unifi_protect_username"),
+        password=(payload or {}).get("unifi_protect_password"),
+        announcement_volume=(payload or {}).get("unifi_protect_announcement_volume"),
     )
     return {
         "unifi_protect_base_url": saved.get("base") or UNIFI_PROTECT_DEFAULT_BASE_URL,
         "unifi_protect_api_key": saved.get("api_key", ""),
+        "unifi_protect_username": saved.get("username", ""),
+        "unifi_protect_password": saved.get("password", ""),
+        "unifi_protect_announcement_volume": _as_int(
+            saved.get("announcement_volume"),
+            UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+            minimum=0,
+            maximum=100,
+        ),
     }
 
 
@@ -863,8 +946,21 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
     current = read_integration_settings()
     base = _text((payload or {}).get("unifi_protect_base_url") or current.get("unifi_protect_base_url")).rstrip("/")
     api_key = _text((payload or {}).get("unifi_protect_api_key") or current.get("unifi_protect_api_key"))
+    username = _text((payload or {}).get("unifi_protect_username") or current.get("unifi_protect_username"))
+    password = _text((payload or {}).get("unifi_protect_password") or current.get("unifi_protect_password"))
+    announcement_volume = _as_int(
+        (payload or {}).get("unifi_protect_announcement_volume")
+        or current.get("unifi_protect_announcement_volume"),
+        UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+        minimum=0,
+        maximum=100,
+    )
     if not api_key:
         raise ValueError("UniFi Protect API key is required.")
+    if bool(username) != bool(password):
+        raise ValueError(
+            "Both the local Protect username and password are required for announcement volume control."
+        )
     cameras, camera_warnings = _list_unifi_rows(
         UNIFI_PROTECT_CAMERA_PATHS,
         "cameras",
@@ -881,14 +977,38 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
     )
     if not cameras and camera_warnings:
         raise RuntimeError(f"UniFi Protect test failed: {camera_warnings[-1]}")
+    private_camera_count: Optional[int] = None
+    if username and password:
+        try:
+            private_camera_count = _test_private_volume_login(
+                _private_volume_config(
+                    {
+                        "base": base,
+                        "username": username,
+                        "password": password,
+                        "announcement_volume": announcement_volume,
+                    }
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"The API key worked, but the local Protect volume-control login failed: {exc}"
+            ) from exc
+    volume_message = (
+        f" Local speaker-volume control is ready for {private_camera_count} camera(s)."
+        if private_camera_count is not None
+        else " Local speaker-volume control is not configured."
+    )
     return {
         "ok": True,
         "camera_count": len(cameras),
         "sensor_count": len(sensors),
+        "private_volume_camera_count": private_camera_count,
         "warnings": sensor_warnings,
         "message": (
             f"UniFi Protect connection worked. Found {len(cameras)} camera{'s' if len(cameras) != 1 else ''} "
             f"and {len(sensors)} sensor{'s' if len(sensors) != 1 else ''}."
+            f"{volume_message}"
         ),
     }
 
@@ -906,19 +1026,325 @@ def _wav_duration_seconds(wav_bytes: bytes) -> float:
         return 0.0
 
 
-def _talkback_audio_args(session: Dict[str, Any]) -> list[str]:
-    codec = _text(session.get("codec")).lower().replace("-", "_")
+def _talkback_audio_profile(session: Dict[str, Any]) -> Dict[str, Any]:
+    raw_codec = _text(session.get("codec")).lower().replace("-", "_")
     sample_rate = _as_int(
         session.get("samplingRate") or session.get("sampling_rate"),
         48000,
         minimum=8000,
         maximum=96000,
     )
-    if "mulaw" in codec or "pcmu" in codec:
-        return ["-ac", "1", "-ar", "8000", "-c:a", "pcm_mulaw"]
-    if "alaw" in codec or "pcma" in codec:
-        return ["-ac", "1", "-ar", "8000", "-c:a", "pcm_alaw"]
-    return ["-ac", "1", "-ar", str(sample_rate or 48000), "-c:a", "libopus", "-application", "voip", "-b:a", "32k"]
+    bits_per_sample = _as_int(
+        session.get("bitsPerSample") or session.get("bits_per_sample"),
+        16,
+        minimum=8,
+        maximum=32,
+    )
+
+    if "aac" in raw_codec:
+        codec = "aac"
+        encoder = "aac"
+        output_format = "adts"
+    elif "opus" in raw_codec:
+        codec = "opus"
+        encoder = "libopus"
+        output_format = "rtp"
+    elif "vorbis" in raw_codec:
+        codec = "vorbis"
+        encoder = "libvorbis"
+        output_format = "ogg"
+    elif "mulaw" in raw_codec or "pcmu" in raw_codec:
+        codec = "mulaw"
+        encoder = "pcm_mulaw"
+        output_format = "rtp"
+        sample_rate = 8000
+    elif "alaw" in raw_codec or "pcma" in raw_codec:
+        codec = "alaw"
+        encoder = "pcm_alaw"
+        output_format = "rtp"
+        sample_rate = 8000
+    else:
+        raise ValueError(f"Unsupported UniFi Protect talkback codec: {raw_codec or 'missing'}")
+
+    return {
+        "codec": codec,
+        "sample_rate": sample_rate,
+        "bits_per_sample": bits_per_sample,
+        "encoder": encoder,
+        "output_format": output_format,
+        "args": ["-ac", "1", "-ar", str(sample_rate), "-c:a", encoder],
+    }
+
+
+def _talkback_audio_args(session: Dict[str, Any]) -> list[str]:
+    return list(_talkback_audio_profile(session)["args"])
+
+
+def _announcement_lock(camera_id: str) -> threading.Lock:
+    token = unifi_camera_id_from_target(camera_id)
+    with _announcement_lock_guard:
+        lock = _announcement_locks.get(token)
+        if lock is None:
+            lock = threading.Lock()
+            _announcement_locks[token] = lock
+        return lock
+
+
+def _private_volume_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    current = dict(settings or read_unifi_protect_settings())
+    base_url = _text(current.get("base") or UNIFI_PROTECT_DEFAULT_BASE_URL)
+    parsed = urlparse(base_url if "://" in base_url else f"https://{base_url}")
+    host = _text(parsed.hostname)
+    if not host:
+        raise ValueError("UniFi Protect console host is required for local volume control.")
+    configured_scheme = _text(parsed.scheme).lower() or "https"
+    if configured_scheme not in {"http", "https"}:
+        raise ValueError("UniFi Protect console URL must use HTTP or HTTPS.")
+    display_host = f"[{host}]" if ":" in host else host
+    configured_port = parsed.port
+    if configured_scheme == "http" and configured_port in {None, 80}:
+        # UniFi OS redirects its HTTP console to HTTPS. Replaying the private
+        # login directly over HTTPS preserves the POST body across that redirect.
+        scheme = "https"
+        port = 443
+    else:
+        scheme = configured_scheme
+        port = int(configured_port or (443 if scheme == "https" else 80))
+    return {
+        "base_url": f"{scheme}://{display_host}:{port}",
+        "username": _text(current.get("username")),
+        "password": _text(current.get("password")),
+        "announcement_volume": _as_int(
+            current.get("announcement_volume"),
+            UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+            minimum=0,
+            maximum=100,
+        ),
+    }
+
+
+class _PrivateProtectVolumeClient:
+    """Minimal local Protect session used only for speaker-volume changes."""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.base_url = _text(config.get("base_url")).rstrip("/")
+        self.username = _text(config.get("username"))
+        self.password = _text(config.get("password"))
+        self.session = requests.Session()
+        self.csrf_token = ""
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Optional[Dict[str, Any]] = None,
+        timeout_s: float = 20.0,
+    ) -> Dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"Tater-UniFi-Protect/{__version__}",
+        }
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                response = self.session.request(
+                    method.upper(),
+                    f"{self.base_url}/{path.lstrip('/')}",
+                    headers=headers,
+                    json=json_body,
+                    timeout=timeout_s,
+                    verify=False,
+                )
+        except Exception as exc:
+            raise RuntimeError(f"local Protect request could not connect: {exc}") from exc
+
+        csrf_token = _text(response.headers.get("x-csrf-token"))
+        if csrf_token:
+            self.csrf_token = csrf_token
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"local Protect request failed (HTTP {response.status_code})"
+            )
+        if not response.content:
+            return {}
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError("local Protect returned an invalid response") from exc
+        return payload if isinstance(payload, dict) else {}
+
+    def login(self) -> None:
+        if not self.username or not self.password:
+            raise ValueError("Local Protect username and password are required.")
+        self._request(
+            "POST",
+            "/api/auth/login",
+            json_body={
+                "username": self.username,
+                "password": self.password,
+                "rememberMe": False,
+            },
+            timeout_s=25.0,
+        )
+
+    def bootstrap(self) -> Dict[str, Any]:
+        return self._request("GET", "/proxy/protect/api/bootstrap", timeout_s=25.0)
+
+    def get_camera(self, camera_id: str) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/proxy/protect/api/cameras/{camera_id}",
+            timeout_s=20.0,
+        )
+
+    def set_speaker_volume(self, camera_id: str, volume: int) -> None:
+        self._request(
+            "PATCH",
+            f"/proxy/protect/api/cameras/{camera_id}",
+            json_body={"speakerSettings": {"speakerVolume": volume}},
+            timeout_s=15.0,
+        )
+
+    def close(self) -> None:
+        self.session.close()
+
+
+def _private_protect_client(config: Dict[str, Any]) -> _PrivateProtectVolumeClient:
+    return _PrivateProtectVolumeClient(config)
+
+
+def _speaker_settings(camera: Dict[str, Any]) -> Dict[str, Any]:
+    settings = camera.get("speakerSettings") or camera.get("speaker_settings") or {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _test_private_volume_login(config: Dict[str, Any]) -> int:
+    client = _private_protect_client(config)
+    try:
+        client.login()
+        cameras = client.bootstrap().get("cameras") or []
+        rows = cameras.values() if isinstance(cameras, dict) else cameras
+        return sum(
+            1
+            for camera in rows
+            if isinstance(camera, dict) and bool(_speaker_settings(camera))
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+def _prepare_private_speaker_volume(
+    config: Dict[str, Any],
+    camera_id: str,
+) -> Dict[str, Any]:
+    client = _private_protect_client(config)
+    try:
+        client.login()
+        camera = client.get_camera(camera_id)
+        if not camera:
+            raise RuntimeError(f"camera {camera_id} was not found by the local Protect account")
+        speaker_settings = _speaker_settings(camera)
+        if not speaker_settings:
+            raise RuntimeError(f"camera {camera_id} did not report speaker settings")
+        previous = speaker_settings.get("speakerVolume")
+        if previous is None:
+            previous = speaker_settings.get("volume")
+        if previous is None:
+            raise RuntimeError(f"camera {camera_id} did not report its current speaker volume")
+        previous_volume = _as_int(previous, 0, minimum=0, maximum=100)
+        target_volume = _as_int(
+            config.get("announcement_volume"),
+            UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
+            minimum=0,
+            maximum=100,
+        )
+        changed = previous_volume != target_volume
+        if changed:
+            client.set_speaker_volume(camera_id, target_volume)
+        return {
+            "client": client,
+            "camera_id": camera_id,
+            "previous_volume": previous_volume,
+            "target_volume": target_volume,
+            "changed": changed,
+        }
+    except Exception:
+        with contextlib.suppress(Exception):
+            client.close()
+        raise
+
+
+def _restore_private_speaker_volume(handle: Dict[str, Any]) -> None:
+    client = handle.get("client")
+    camera_id = _text(handle.get("camera_id"))
+    try:
+        if bool(handle.get("changed")) and client is not None and camera_id:
+            client.set_speaker_volume(
+                camera_id,
+                _as_int(handle.get("previous_volume"), 0, minimum=0, maximum=100),
+            )
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+
+def _play_unifi_camera_audio_sync(
+    *,
+    camera_id: str,
+    ffmpeg_path: str,
+    input_path: str,
+    run_timeout: float,
+) -> Dict[str, Any]:
+    session = unifi_protect_request(
+        "POST",
+        f"/proxy/protect/integration/v1/cameras/{camera_id}/talkback-session",
+        timeout_s=20.0,
+    )
+    stream_url = _text(session.get("url") or session.get("streamUrl") or session.get("stream_url"))
+    if not stream_url:
+        raise RuntimeError("talkback session did not return a stream URL")
+    profile = _talkback_audio_profile(session)
+    logger.info(
+        "UniFi Protect talkback %s: codec=%s rate=%s bits=%s format=%s",
+        camera_id,
+        profile["codec"],
+        profile["sample_rate"],
+        profile["bits_per_sample"],
+        profile["output_format"],
+    )
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-re",
+        "-i",
+        input_path,
+        "-vn",
+        *profile["args"],
+        "-f",
+        profile["output_format"],
+        stream_url,
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=run_timeout,
+        check=False,
+        **_subprocess_spawn_kwargs(),
+    )
+    if proc.returncode == 0:
+        return {"ok": True}
+    detail = _text(proc.stderr) or _text(proc.stdout) or f"ffmpeg exited {proc.returncode}"
+    return {"ok": False, "error": detail[:220]}
 
 
 def play_unifi_protect_audio_sync(
@@ -943,7 +1369,16 @@ def play_unifi_protect_audio_sync(
     run_timeout = max(float(timeout_s or DEFAULT_UNIFI_PROTECT_AUDIO_TIMEOUT_SECONDS), duration_s + 20.0, 30.0)
     sent_count = 0
     failures: list[str] = []
+    warnings_out: list[str] = []
     tmp_path = ""
+    volume_config = _private_volume_config()
+    local_username = _text(volume_config.get("username"))
+    local_password = _text(volume_config.get("password"))
+    volume_enabled = bool(local_username and local_password)
+    if bool(local_username) != bool(local_password):
+        warnings_out.append(
+            "UniFi announcement volume was unchanged because both the local username and password are required."
+        )
 
     try:
         with tempfile.NamedTemporaryFile(prefix="tater-unifi-announcement-", suffix=".wav", delete=False) as tmp_file:
@@ -951,45 +1386,42 @@ def play_unifi_protect_audio_sync(
             tmp_path = tmp_file.name
 
         for camera_id in clean_cameras:
-            try:
-                session = unifi_protect_request(
-                    "POST",
-                    f"/proxy/protect/integration/v1/cameras/{camera_id}/talkback-session",
-                    timeout_s=20.0,
-                )
-                stream_url = _text(session.get("url") or session.get("streamUrl") or session.get("stream_url"))
-                if not stream_url:
-                    raise RuntimeError("talkback session did not return a stream URL")
-                cmd = [
-                    ffmpeg_path,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-nostdin",
-                    "-re",
-                    "-i",
-                    tmp_path,
-                    "-vn",
-                    *_talkback_audio_args(session),
-                    "-f",
-                    "rtp",
-                    stream_url,
-                ]
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=run_timeout,
-                    check=False,
-                    **_subprocess_spawn_kwargs(),
-                )
-                if proc.returncode == 0:
-                    sent_count += 1
-                    continue
-                detail = _text(proc.stderr) or _text(proc.stdout) or f"ffmpeg exited {proc.returncode}"
-                failures.append(f"{camera_id} ({detail[:220]})")
-            except Exception as exc:
-                failures.append(f"{camera_id} ({exc})")
+            with _announcement_lock(camera_id):
+                volume_handle: Optional[Dict[str, Any]] = None
+                try:
+                    if volume_enabled:
+                        try:
+                            volume_handle = _prepare_private_speaker_volume(
+                                volume_config,
+                                camera_id,
+                            )
+                        except Exception as exc:
+                            warnings_out.append(
+                                f"{camera_id}: announcement volume was unchanged ({exc})"
+                            )
+                    playback = _play_unifi_camera_audio_sync(
+                        camera_id=camera_id,
+                        ffmpeg_path=ffmpeg_path,
+                        input_path=tmp_path,
+                        run_timeout=run_timeout,
+                    )
+                    if playback.get("ok"):
+                        sent_count += 1
+                    else:
+                        failures.append(
+                            f"{camera_id} ({_text(playback.get('error')) or 'playback failed'})"
+                        )
+                except Exception as exc:
+                    failures.append(f"{camera_id} ({exc})")
+                finally:
+                    if volume_handle is not None:
+                        try:
+                            _restore_private_speaker_volume(volume_handle)
+                        except Exception as exc:
+                            warnings_out.append(
+                                f"{camera_id}: failed to restore speaker volume to "
+                                f"{volume_handle.get('previous_volume')}% ({exc})"
+                            )
     finally:
         if tmp_path:
             with contextlib.suppress(Exception):
@@ -997,10 +1429,18 @@ def play_unifi_protect_audio_sync(
 
     if sent_count:
         result: Dict[str, Any] = {"ok": True, "sent_count": sent_count}
-        if failures:
-            result["warnings"] = failures
+        combined_warnings = [*warnings_out, *failures]
+        if combined_warnings:
+            result["warnings"] = combined_warnings
         return result
-    return {"ok": False, "sent_count": 0, "error": "; ".join(failures) or "UniFi Protect playback failed."}
+    result = {
+        "ok": False,
+        "sent_count": 0,
+        "error": "; ".join(failures) or "UniFi Protect playback failed.",
+    }
+    if warnings_out:
+        result["warnings"] = warnings_out
+    return result
 
 
 def _mime_from_filename(filename: str) -> str:
