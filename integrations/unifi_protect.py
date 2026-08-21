@@ -1,8 +1,9 @@
 from __future__ import annotations
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import base64
 import contextlib
+from datetime import datetime
 import io
 import json
 import logging
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import warnings
 import wave
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,11 +59,12 @@ def _subprocess_spawn_kwargs() -> Dict[str, Any]:
 INTEGRATION = {
     "id": "unifi_protect",
     "name": "UniFi Protect",
-    "description": "UniFi Protect API key for cameras, sensors, and direct speaker announcements.",
+    "description": "UniFi Protect cameras, recorded clips, sensors, and direct speaker announcements.",
     "badge": "PRO",
     "order": 70,
     "capabilities": [
         "camera",
+        "video_clip",
         "doorbell",
         "motion",
         "entry_sensor",
@@ -92,7 +95,8 @@ INTEGRATION = {
             "type": "text",
             "default": "",
             "description": (
-                "Optional local-only Protect account used to raise announcement volume. "
+                "Optional local-only Protect account used for recorded clip export and announcement volume. "
+                "Adding both local credentials enables Video descriptions for Protect cameras in Awareness. "
                 "Use a least-privileged local account, not a UI.com owner account."
             ),
         },
@@ -101,7 +105,7 @@ INTEGRATION = {
             "label": "Local Protect Password",
             "type": "password",
             "default": "",
-            "description": "Required with the local username for temporary speaker-volume control.",
+            "description": "Required with the local username for recorded clip export and speaker-volume control.",
         },
         {
             "key": "unifi_protect_announcement_volume",
@@ -542,8 +546,10 @@ def _unifi_camera_smart_detect_types(row: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _unifi_camera_capabilities(row: Dict[str, Any]) -> List[str]:
+def _unifi_camera_capabilities(row: Dict[str, Any], *, clip_available: bool = False) -> List[str]:
     caps = ["camera", "snapshot", "motion"]
+    if clip_available:
+        caps.append("video_clip")
     for smart_type in _unifi_camera_smart_detect_types(row):
         token = f"smart_{smart_type}"
         if token not in caps:
@@ -780,6 +786,10 @@ def integration_devices() -> Dict[str, Any]:
         return {"devices": [], "message": "UniFi Protect is not configured."}
     rows: List[Dict[str, Any]] = []
     warnings_out: List[str] = []
+    protect_settings = read_unifi_protect_settings()
+    clip_available = bool(
+        _text(protect_settings.get("username")) and _text(protect_settings.get("password"))
+    )
     cameras, camera_warnings = _list_unifi_rows(UNIFI_PROTECT_CAMERA_PATHS, "cameras", timeout_s=20.0)
     sensors, sensor_warnings = _list_unifi_rows(UNIFI_PROTECT_SENSOR_PATHS, "sensors", timeout_s=20.0)
     warnings_out.extend(camera_warnings)
@@ -817,10 +827,11 @@ def integration_devices() -> Dict[str, Any]:
                 "name": name or camera_id or "Camera",
                 "type": "camera",
                 "ref": camera_entity or f"camera:{camera_id}",
-                "capabilities": _unifi_camera_capabilities(camera),
-                "actions": ["camera_snapshot"],
+                "capabilities": _unifi_camera_capabilities(camera, clip_available=clip_available),
+                "actions": ["camera_snapshot", *(("camera_clip",) if clip_available else ())],
                 "features": [
                     "snapshot",
+                    *(("video_clip",) if clip_available else ()),
                     "motion",
                     *_unifi_camera_smart_detect_types(camera),
                     *(("doorbell",) if _unifi_camera_is_doorbell(camera) else ()),
@@ -1123,8 +1134,8 @@ def _private_volume_config(settings: Optional[Dict[str, Any]] = None) -> Dict[st
     }
 
 
-class _PrivateProtectVolumeClient:
-    """Minimal local Protect session used only for speaker-volume changes."""
+class _PrivateProtectClient:
+    """Minimal local Protect session for recorded clips and speaker-volume changes."""
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.base_url = _text(config.get("base_url")).rstrip("/")
@@ -1209,12 +1220,45 @@ class _PrivateProtectVolumeClient:
             timeout_s=15.0,
         )
 
+    def download_camera_clip(self, camera_id: str, *, start_ms: int, end_ms: int) -> Tuple[bytes, str]:
+        headers = {
+            "Accept": "video/mp4,video/*,*/*",
+            "User-Agent": f"Tater-UniFi-Protect/{__version__}",
+        }
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                response = self.session.request(
+                    "GET",
+                    f"{self.base_url}/proxy/protect/api/video/export",
+                    headers=headers,
+                    params={
+                        "camera": camera_id,
+                        "channel": 0,
+                        "start": int(start_ms),
+                        "end": int(end_ms),
+                    },
+                    timeout=75.0,
+                    verify=False,
+                )
+        except Exception as exc:
+            raise RuntimeError(f"local Protect clip export could not connect: {exc}") from exc
+        if response.status_code >= 400:
+            raise RuntimeError(f"local Protect clip export failed (HTTP {response.status_code})")
+        content = bytes(response.content or b"")
+        if len(content) < 1000:
+            raise RuntimeError("local Protect clip export returned an empty video")
+        content_type = _text(response.headers.get("Content-Type")).split(";", 1)[0] or "video/mp4"
+        return content, content_type
+
     def close(self) -> None:
         self.session.close()
 
 
-def _private_protect_client(config: Dict[str, Any]) -> _PrivateProtectVolumeClient:
-    return _PrivateProtectVolumeClient(config)
+def _private_protect_client(config: Dict[str, Any]) -> _PrivateProtectClient:
+    return _PrivateProtectClient(config)
 
 
 def _speaker_settings(camera: Dict[str, Any]) -> Dict[str, Any]:
@@ -1586,8 +1630,113 @@ def get_camera_snapshot(device_id: Any) -> Tuple[bytes, str]:
     return ProtectClient().get_camera_snapshot(camera_id)
 
 
+def _clip_timestamp_seconds(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        token = _text(value)
+        if not token:
+            return 0.0
+        try:
+            parsed = float(token)
+        except (TypeError, ValueError):
+            try:
+                parsed = datetime.fromisoformat(token.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                return 0.0
+    if parsed > 100_000_000_000:
+        parsed /= 1000.0
+    return parsed if parsed > 0 else 0.0
+
+
+def _unifi_camera_clip_window(payload: Dict[str, Any]) -> Tuple[int, int, int]:
+    request = dict(payload or {})
+    duration = _as_int(request.get("duration_seconds"), 8, minimum=1, maximum=30)
+    pre_event = _as_int(request.get("pre_event_seconds"), 2, minimum=0, maximum=duration)
+    post_event = _as_int(request.get("post_event_seconds"), 4, minimum=0, maximum=10)
+    event_start = _clip_timestamp_seconds(request.get("event_start"))
+    event_end = _clip_timestamp_seconds(request.get("event_end"))
+    now = time.time()
+    if event_start > 0:
+        desired_end = event_end if event_end >= event_start else event_start + post_event
+        wait_seconds = min(5.0, max(0.0, desired_end - now))
+        if wait_seconds:
+            time.sleep(wait_seconds)
+        end = min(desired_end, time.time())
+        start = min(event_start - pre_event, end - 1.0)
+        if end - start > duration:
+            start = end - duration
+    else:
+        end = now
+        start = end - duration
+    if end - start < 1.0:
+        start = end - 1.0
+    return int(start * 1000), int(end * 1000), duration
+
+
+def get_camera_clip(device_id: Any, payload: Optional[Dict[str, Any]] = None) -> Tuple[bytes, str, Dict[str, Any]]:
+    camera_id = unifi_camera_id_from_target(device_id)
+    if not camera_id:
+        raise ValueError("UniFi Protect camera id is required.")
+    start_ms, end_ms, duration = _unifi_camera_clip_window(dict(payload or {}))
+    api_error: Optional[Exception] = None
+    try:
+        content, headers = unifi_protect_request(
+            "GET",
+            "/proxy/protect/api/video/export",
+            params={
+                "camera": camera_id,
+                "channel": 0,
+                "start": start_ms,
+                "end": end_ms,
+            },
+            headers={"Accept": "video/mp4,video/*,*/*"},
+            stream=True,
+            timeout_s=75.0,
+        )
+        clip = bytes(content or b"") if isinstance(content, (bytes, bytearray)) else b""
+        if len(clip) < 1000:
+            raise RuntimeError("API-key clip export returned an empty video")
+        content_type = _text(headers.get("Content-Type") if isinstance(headers, dict) else "").split(";", 1)[0]
+        return clip, content_type or "video/mp4", {
+            "start": start_ms,
+            "end": end_ms,
+            "duration_seconds": duration,
+            "source": "unifi_recording",
+        }
+    except Exception as exc:
+        api_error = exc
+
+    config = _private_volume_config()
+    if not _text(config.get("username")) or not _text(config.get("password")):
+        raise RuntimeError(
+            "UniFi Protect did not allow clip export with the API key. Add the optional local Protect "
+            f"username and password to enable recorded clips ({api_error})."
+        )
+    client = _private_protect_client(config)
+    try:
+        client.login()
+        content, content_type = client.download_camera_clip(
+            camera_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+    finally:
+        client.close()
+    return content, content_type, {
+        "start": start_ms,
+        "end": end_ms,
+        "duration_seconds": duration,
+        "source": "unifi_recording",
+    }
+
+
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if _text(action_id) not in {"camera_snapshot", "snapshot"}:
+    action = _text(action_id).lower()
+    if action in {"camera_clip", "video_clip", "clip"}:
+        content, content_type, metadata = get_camera_clip(device_id, payload)
+        return {"ok": True, "bytes": content, "content_type": content_type, **metadata}
+    if action not in {"camera_snapshot", "snapshot"}:
         raise KeyError(f"Unsupported UniFi Protect device action: {action_id}")
     content, content_type = get_camera_snapshot(device_id)
     return {"ok": True, "bytes": content, "content_type": content_type}

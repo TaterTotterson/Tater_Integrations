@@ -1,12 +1,17 @@
 from __future__ import annotations
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 import asyncio
 import io
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import threading
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import requests
 
@@ -14,11 +19,13 @@ from helpers import redis_client
 
 HOMEASSISTANT_SETTINGS_KEY = "homeassistant_settings"
 HOMEASSISTANT_DEFAULT_BASE_URL = "http://homeassistant.local:8123"
+HOMEASSISTANT_CAMERA_STREAM_FEATURE = 2
+HOMEASSISTANT_CAMERA_CLIP_MAX_SECONDS = 30
 
 INTEGRATION = {
     "id": "homeassistant",
     "name": "Home Assistant",
-    "description": "Shared Home Assistant endpoint and token for portals, verbas, and announcement paths.",
+    "description": "Shared Home Assistant endpoint and token for devices, camera snapshots and short camera clips.",
     "badge": "HA",
     "order": 10,
     "capabilities": [
@@ -36,6 +43,7 @@ INTEGRATION = {
         "leak",
         "battery",
         "camera",
+        "video_clip",
         "cover",
         "climate",
         "media_player",
@@ -328,6 +336,7 @@ def _homeassistant_entity_details(row: Dict[str, Any]) -> Dict[str, Any]:
         "battery_level",
         "last_changed",
         "last_updated",
+        "supported_features",
     ):
         value = attrs.get(key) if key in attrs else row.get(key)
         if value not in (None, ""):
@@ -445,6 +454,14 @@ def _homeassistant_entity_event_sources(
     return [source]
 
 
+def _homeassistant_camera_supports_clip(attrs: Dict[str, Any]) -> bool:
+    try:
+        supported_features = int(float(attrs.get("supported_features") or 0))
+    except (TypeError, ValueError):
+        supported_features = 0
+    return bool(supported_features & HOMEASSISTANT_CAMERA_STREAM_FEATURE) and bool(shutil.which("ffmpeg"))
+
+
 def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) -> list[str]:
     domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
     device_class = _text(attrs.get("device_class")).lower()
@@ -459,6 +476,8 @@ def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) ->
     if domain == "camera":
         add("camera")
         add("snapshot")
+        if _homeassistant_camera_supports_clip(attrs):
+            add("video_clip")
     if domain == "light":
         add("switch")
         supported = attrs.get("supported_color_modes")
@@ -563,7 +582,10 @@ def _homeassistant_entity_actions(entity_id: str, capabilities: list[str]) -> li
     if domain == "script":
         return ["run"]
     if domain == "camera" or "snapshot" in caps:
-        return ["camera_snapshot"]
+        actions = ["camera_snapshot"]
+        if "video_clip" in caps:
+            actions.append("camera_clip")
+        return actions
     return []
 
 
@@ -678,12 +700,127 @@ def get_camera_snapshot(device_id: Any) -> tuple[bytes, str]:
     return response.content, content_type.split(";", 1)[0].strip() or "image/jpeg"
 
 
+def _homeassistant_camera_stream_url(device_id: Any) -> str:
+    config = load_homeassistant_config(required=True)
+    entity_id = _text(device_id)
+    if not entity_id.startswith("camera."):
+        raise ValueError("Home Assistant camera entity is required.")
+    result = _run_sync(
+        call(
+            config["base"],
+            config["token"],
+            {"type": "camera/stream", "id": 1, "entity_id": entity_id, "format": "hls"},
+            timeout_s=30.0,
+        )
+    )
+    raw_url = _text(result.get("url")) if isinstance(result, dict) else ""
+    if not raw_url:
+        raise RuntimeError(f"Home Assistant did not provide an HLS stream for {entity_id}.")
+    return urljoin(f"{config['base'].rstrip('/')}/", raw_url)
+
+
+def _homeassistant_clip_duration(payload: Dict[str, Any]) -> int:
+    try:
+        value = int(float((payload or {}).get("duration_seconds") or 8))
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(HOMEASSISTANT_CAMERA_CLIP_MAX_SECONDS, value))
+
+
+def get_camera_clip(device_id: Any, payload: Optional[Dict[str, Any]] = None) -> tuple[bytes, str, Dict[str, Any]]:
+    entity_id = _text(device_id)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to capture Home Assistant camera clips.")
+    duration = _homeassistant_clip_duration(dict(payload or {}))
+    stream_url = _homeassistant_camera_stream_url(entity_id)
+    fd, output_path = tempfile.mkstemp(prefix="tater-ha-camera-", suffix=".mp4")
+    os.close(fd)
+    try:
+        copy_command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        completed = subprocess.run(
+            copy_command,
+            capture_output=True,
+            text=True,
+            timeout=duration + 35,
+            check=False,
+        )
+        if completed.returncode != 0 or not Path(output_path).is_file() or Path(output_path).stat().st_size < 1000:
+            transcode_command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                stream_url,
+                "-t",
+                str(duration),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-r",
+                "4",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "28",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            completed = subprocess.run(
+                transcode_command,
+                capture_output=True,
+                text=True,
+                timeout=duration + 45,
+                check=False,
+            )
+        if completed.returncode != 0:
+            error = _text(completed.stderr)[-400:]
+            raise RuntimeError(f"Home Assistant camera clip capture failed: {error or 'ffmpeg failed'}")
+        content = Path(output_path).read_bytes()
+        if len(content) < 1000:
+            raise RuntimeError("Home Assistant camera clip capture returned an empty video.")
+        return content, "video/mp4", {"duration_seconds": duration, "source": "homeassistant_hls"}
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     action = _text(action_id).lower()
     entity_id = _text(device_id)
     if action in {"camera_snapshot", "snapshot"}:
         content, content_type = get_camera_snapshot(entity_id)
         return {"ok": True, "bytes": content, "content_type": content_type}
+    if action in {"camera_clip", "video_clip", "clip"}:
+        content, content_type, metadata = get_camera_clip(entity_id, payload)
+        return {"ok": True, "bytes": content, "content_type": content_type, **metadata}
 
     if "." not in entity_id:
         raise ValueError("Home Assistant entity id is required.")

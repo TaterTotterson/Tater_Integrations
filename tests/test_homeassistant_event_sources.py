@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,30 @@ class HomeAssistantEventSourceTests(unittest.TestCase):
 
         self.assertEqual(sources[0]["trigger_events"], ["changed", "above", "below"])
         self.assertEqual(sources[0]["unit"], "W")
+
+    def test_stream_camera_advertises_real_clip_capability_and_action(self) -> None:
+        attrs = {"supported_features": homeassistant.HOMEASSISTANT_CAMERA_STREAM_FEATURE}
+        with patch.object(homeassistant.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            capabilities = homeassistant._homeassistant_entity_capabilities("camera.front", attrs)
+
+        self.assertIn("video_clip", capabilities)
+        self.assertEqual(
+            homeassistant._homeassistant_entity_actions("camera.front", capabilities),
+            ["camera_snapshot", "camera_clip"],
+        )
+
+    def test_camera_without_stream_does_not_advertise_clip(self) -> None:
+        with patch.object(homeassistant.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            capabilities = homeassistant._homeassistant_entity_capabilities(
+                "camera.front",
+                {"supported_features": 0},
+            )
+
+        self.assertNotIn("video_clip", capabilities)
+        self.assertEqual(
+            homeassistant._homeassistant_entity_actions("camera.front", capabilities),
+            ["camera_snapshot"],
+        )
 
 
 if __name__ == "__main__":

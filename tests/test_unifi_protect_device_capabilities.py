@@ -49,6 +49,10 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
 
         self.assertTrue(unifi_protect._unifi_camera_is_doorbell(row))
         self.assertIn("doorbell", unifi_protect._unifi_camera_capabilities(row))
+        self.assertIn(
+            "video_clip",
+            unifi_protect._unifi_camera_capabilities(row, clip_available=True),
+        )
         self.assertEqual(
             [source["type"] for source in unifi_protect._unifi_camera_event_sources("front", row)],
             ["motion", "smart_person", "smart_animal", "doorbell"],
@@ -58,6 +62,13 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
         row = {"name": "Front Entry", "featureFlags": {"hasChime": True}}
 
         self.assertTrue(unifi_protect._unifi_camera_is_doorbell(row))
+
+    def test_clip_capability_requires_configured_private_media_access(self) -> None:
+        self.assertNotIn("video_clip", unifi_protect._unifi_camera_capabilities({}))
+        self.assertIn(
+            "video_clip",
+            unifi_protect._unifi_camera_capabilities({}, clip_available=True),
+        )
 
     def test_talkback_profile_matches_unifi_codec_container(self) -> None:
         cases = (
@@ -289,6 +300,41 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
         )
 
         self.assertEqual(config["base_url"], "https://10.4.20.127:443")
+
+    def test_clip_window_uses_event_time_and_bounds_duration(self) -> None:
+        with (
+            patch.object(unifi_protect.time, "time", return_value=1_786_486_910.0),
+            patch.object(unifi_protect.time, "sleep") as sleep,
+        ):
+            start_ms, end_ms, duration = unifi_protect._unifi_camera_clip_window(
+                {
+                    "event_start": 1_786_486_908_000,
+                    "duration_seconds": 8,
+                    "pre_event_seconds": 2,
+                    "post_event_seconds": 4,
+                }
+            )
+
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(duration, 8)
+        self.assertEqual(start_ms, 1_786_486_906_000)
+        self.assertEqual(end_ms, 1_786_486_910_000)
+
+    def test_camera_clip_action_returns_integration_media_contract(self) -> None:
+        with patch.object(
+            unifi_protect,
+            "get_camera_clip",
+            return_value=(b"video", "video/mp4", {"duration_seconds": 8}),
+        ):
+            result = unifi_protect.run_integration_device_action(
+                "camera_clip",
+                "front-door",
+                {"duration_seconds": 8},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["bytes"], b"video")
+        self.assertEqual(result["content_type"], "video/mp4")
 
 
 if __name__ == "__main__":
