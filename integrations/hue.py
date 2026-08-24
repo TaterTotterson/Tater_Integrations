@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 import ipaddress
 import json
@@ -1011,8 +1011,9 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
     body: Dict[str, Any] = {}
     if action in aliases:
         body["on"] = {"on": bool(aliases[action])}
-    if action == "set_brightness":
-        brightness = (payload or {}).get("brightness_pct", (payload or {}).get("brightness"))
+    brightness = (payload or {}).get("brightness_pct", (payload or {}).get("brightness"))
+    brightness_requested = action == "set_brightness" or (aliases.get(action) is True and brightness is not None)
+    if brightness_requested:
         if brightness is None:
             raise ValueError("Hue brightness action requires brightness_pct.")
         pct = max(0.0, min(100.0, float(brightness)))
