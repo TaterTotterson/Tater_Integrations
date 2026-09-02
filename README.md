@@ -225,6 +225,7 @@ Tater looks for these functions by name. Only implement the ones your integratio
 - `run_integration_action(action_id, payload)`: runs settings/shop actions such as `test`, `discover`, `pair`, or `forget_pairing`.
 - `run_integration_device_action(action_id, device_id, payload)`: runs actions against a specific exposed device.
 - `integration_poll_events(client=None, cursor=None)`: optionally returns events/states for runtime polling.
+- `integration_runtime_event_allowed(*, kind, payload, client=None)`: optionally approves or rejects live runtime data before Tater caches or publishes it. It may be synchronous or asynchronous.
 
 Provider-specific helper functions are fine too. Existing cores and Verbas can lazy-load them through Tater's integration store, but new generic behavior should prefer shared capability hooks such as the device contract, media playback contract, web search contract, and runtime polling contract.
 
@@ -454,3 +455,15 @@ Return:
 State and event payloads must include one of `entity_id`, `ref`, `device_ref`, `resource_ref`, `id`, or `device_id` matching a device row or event source. Tater stores current states and recent events in its runtime cache and the Settings UI shows recent changes from that cache.
 
 Optional runtime polling can also return only `states`, only `events`, or a plain list of events. If there are no changes, return empty lists and the next cursor.
+
+An integration that lets users limit which provider devices reach Tater can expose a runtime filter using the same setting as its `integration_devices()` filter:
+
+```python
+async def integration_runtime_event_allowed(*, kind, payload, client=None):
+    settings = read_provider_settings(client)
+    if settings.get("device_scope") == "all":
+        return True
+    return await provider_device_is_allowed(kind=kind, payload=payload, settings=settings)
+```
+
+Tater calls this hook before storing states or publishing events from generic integration pollers. Provider listeners that Tater already maintains, such as Home Assistant, use the same hook. If the hook is absent, runtime data is allowed. If it raises an exception, Tater blocks that item and records the filter error rather than silently exposing it.

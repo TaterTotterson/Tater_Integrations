@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import asyncio
 import io
@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import quote, urljoin
 
@@ -18,9 +19,58 @@ import requests
 from helpers import redis_client
 
 HOMEASSISTANT_SETTINGS_KEY = "homeassistant_settings"
+HOMEASSISTANT_RUNTIME_STATES_KEY = "tater:integration_runtime:states"
 HOMEASSISTANT_DEFAULT_BASE_URL = "http://homeassistant.local:8123"
+HOMEASSISTANT_ENTITY_SCOPE_ALL = "all"
+HOMEASSISTANT_ENTITY_SCOPE_ASSIST = "assist"
+HOMEASSISTANT_DEFAULT_ENTITY_SCOPE = HOMEASSISTANT_ENTITY_SCOPE_ALL
+HOMEASSISTANT_ASSIST_POLICY_CACHE_SECONDS = 30
 HOMEASSISTANT_CAMERA_STREAM_FEATURE = 2
 HOMEASSISTANT_CAMERA_CLIP_MAX_SECONDS = 30
+
+# Keep these aligned with Home Assistant's homeassistant.exposed_entities
+# defaults. Explicit per-entity Assist choices always take precedence.
+HOMEASSISTANT_ASSIST_DEFAULT_DOMAINS = {
+    "climate",
+    "cover",
+    "fan",
+    "humidifier",
+    "light",
+    "media_player",
+    "scene",
+    "switch",
+    "todo",
+    "vacuum",
+    "water_heater",
+}
+HOMEASSISTANT_ASSIST_DEFAULT_BINARY_SENSOR_DEVICE_CLASSES = {
+    "door",
+    "garage_door",
+    "lock",
+    "motion",
+    "opening",
+    "presence",
+    "window",
+}
+HOMEASSISTANT_ASSIST_DEFAULT_SENSOR_DEVICE_CLASSES = {
+    "aqi",
+    "carbon_monoxide",
+    "carbon_dioxide",
+    "humidity",
+    "pm10",
+    "pm25",
+    "temperature",
+    "volatile_organic_compounds",
+}
+_ASSIST_POLICY_CACHE_LOCK = threading.RLock()
+_ASSIST_POLICY_CACHE: Dict[str, Any] = {
+    "base": "",
+    "token": "",
+    "policy": None,
+    "loaded_at": 0.0,
+    "retry_at": 0.0,
+    "error": "",
+}
 
 INTEGRATION = {
     "id": "homeassistant",
@@ -62,6 +112,23 @@ INTEGRATION = {
             "type": "password",
             "default": "",
         },
+        {
+            "key": "homeassistant_entity_scope",
+            "label": "Devices Available to Tater",
+            "type": "select",
+            "options": [
+                {"value": HOMEASSISTANT_ENTITY_SCOPE_ALL, "label": "All Home Assistant entities"},
+                {
+                    "value": HOMEASSISTANT_ENTITY_SCOPE_ASSIST,
+                    "label": "Only entities exposed to Assist",
+                },
+            ],
+            "default": HOMEASSISTANT_DEFAULT_ENTITY_SCOPE,
+            "description": (
+                "Uses Home Assistant Settings > Voice assistants > Expose choices. "
+                "Assist-only mode requires a Home Assistant administrator token."
+            ),
+        },
     ],
     "actions": [
         {
@@ -77,29 +144,101 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    token = _text(value).lower()
+    if token in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if token in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return bool(default)
+
+
+def normalize_homeassistant_entity_scope(value: Any) -> str:
+    token = _text(value).lower().replace("-", "_").replace(" ", "_")
+    if token in {"assist", "assistant", "exposed", "assist_only", "voice_assistant"}:
+        return HOMEASSISTANT_ENTITY_SCOPE_ASSIST
+    return HOMEASSISTANT_ENTITY_SCOPE_ALL
+
+
+def _invalidate_assist_policy_cache() -> None:
+    with _ASSIST_POLICY_CACHE_LOCK:
+        _ASSIST_POLICY_CACHE.update(
+            {
+                "base": "",
+                "token": "",
+                "policy": None,
+                "loaded_at": 0.0,
+                "retry_at": 0.0,
+                "error": "",
+            }
+        )
+
+
+def _clear_homeassistant_runtime_states(client: Any) -> int:
+    if client is None:
+        return 0
+    try:
+        rows = client.hgetall(HOMEASSISTANT_RUNTIME_STATES_KEY) or {}
+    except Exception:
+        return 0
+    removed = 0
+    for key, value in rows.items() if isinstance(rows, dict) else []:
+        key_text = _text(key)
+        provider = key_text.split(":", 1)[0].lower()
+        if provider != "homeassistant":
+            try:
+                record = json.loads(_text(value))
+            except Exception:
+                record = {}
+            provider = _text(record.get("provider") if isinstance(record, dict) else "").lower()
+        if provider != "homeassistant":
+            continue
+        try:
+            removed += int(client.hdel(HOMEASSISTANT_RUNTIME_STATES_KEY, key) or 0)
+        except Exception:
+            continue
+    return removed
+
+
 def load_homeassistant_config(*, required: bool = False, client: Any = None) -> Dict[str, str]:
     settings = (client or redis_client).hgetall(HOMEASSISTANT_SETTINGS_KEY) or {}
     base = _text(settings.get("HA_BASE_URL") or HOMEASSISTANT_DEFAULT_BASE_URL).rstrip("/")
     token = _text(settings.get("HA_TOKEN"))
+    entity_scope = normalize_homeassistant_entity_scope(settings.get("HA_ENTITY_SCOPE"))
     if required and not token:
         raise ValueError(
             "Home Assistant token is not set. Open WebUI -> Settings -> Home Assistant Settings and add HA_TOKEN."
         )
-    return {"base": base, "token": token}
+    return {"base": base, "token": token, "entity_scope": entity_scope}
 
 
-def save_homeassistant_config(*, base_url: Any = None, token: Any = None, client: Any = None) -> Dict[str, str]:
+def save_homeassistant_config(
+    *,
+    base_url: Any = None,
+    token: Any = None,
+    entity_scope: Any = None,
+    client: Any = None,
+) -> Dict[str, str]:
     store = client or redis_client
     current = load_homeassistant_config(required=False, client=store)
     next_base = _text(current.get("base") if base_url is None else base_url) or HOMEASSISTANT_DEFAULT_BASE_URL
     next_token = _text(current.get("token") if token is None else token)
+    next_entity_scope = normalize_homeassistant_entity_scope(
+        current.get("entity_scope") if entity_scope is None else entity_scope
+    )
     store.hset(
         HOMEASSISTANT_SETTINGS_KEY,
         mapping={
             "HA_BASE_URL": next_base.rstrip("/"),
             "HA_TOKEN": next_token,
+            "HA_ENTITY_SCOPE": next_entity_scope,
         },
     )
+    if normalize_homeassistant_entity_scope(current.get("entity_scope")) != next_entity_scope:
+        _invalidate_assist_policy_cache()
+        _clear_homeassistant_runtime_states(store)
     return load_homeassistant_config(required=False, client=store)
 
 
@@ -108,6 +247,7 @@ def read_integration_settings() -> Dict[str, Any]:
     return {
         "homeassistant_base_url": config.get("base") or HOMEASSISTANT_DEFAULT_BASE_URL,
         "homeassistant_token": config.get("token", ""),
+        "homeassistant_entity_scope": normalize_homeassistant_entity_scope(config.get("entity_scope")),
     }
 
 
@@ -115,10 +255,12 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     saved = save_homeassistant_config(
         base_url=(payload or {}).get("homeassistant_base_url"),
         token=(payload or {}).get("homeassistant_token"),
+        entity_scope=(payload or {}).get("homeassistant_entity_scope"),
     )
     return {
         "homeassistant_base_url": saved.get("base") or HOMEASSISTANT_DEFAULT_BASE_URL,
         "homeassistant_token": saved.get("token", ""),
+        "homeassistant_entity_scope": normalize_homeassistant_entity_scope(saved.get("entity_scope")),
     }
 
 
@@ -129,6 +271,9 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
     current = read_integration_settings()
     base = _text((payload or {}).get("homeassistant_base_url") or current.get("homeassistant_base_url")).rstrip("/")
     token = _text((payload or {}).get("homeassistant_token") or current.get("homeassistant_token"))
+    entity_scope = normalize_homeassistant_entity_scope(
+        (payload or {}).get("homeassistant_entity_scope") or current.get("homeassistant_entity_scope")
+    )
     if not base:
         raise ValueError("Home Assistant base URL is required.")
     if not token:
@@ -141,6 +286,16 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
     )
     if response.status_code >= 400:
         raise RuntimeError(f"Home Assistant test failed: HTTP {response.status_code}: {response.text[:200]}")
+    if entity_scope == HOMEASSISTANT_ENTITY_SCOPE_ASSIST:
+        policy = assist_exposure_policy_sync(base, token, timeout_s=12.0)
+        exposed_count = len(policy.get("explicitly_exposed") or set())
+        return {
+            "ok": True,
+            "message": (
+                "Home Assistant connection worked and Tater can read the Assist exposure settings "
+                f"({exposed_count} explicitly exposed)."
+            ),
+        }
     return {"ok": True, "message": "Home Assistant connection worked."}
 
 
@@ -241,6 +396,259 @@ async def area_registry_list(base_url: Any, token: Any, *, timeout_s: float = 30
     return result if isinstance(result, list) else []
 
 
+async def exposed_entity_list(base_url: Any, token: Any, *, timeout_s: float = 30.0) -> Dict[str, Any]:
+    result = await call(
+        base_url,
+        token,
+        {"type": "homeassistant/expose_entity/list", "id": 1},
+        timeout_s=timeout_s,
+    )
+    return result if isinstance(result, dict) else {}
+
+
+async def expose_new_entities_get(
+    base_url: Any,
+    token: Any,
+    *,
+    assistant: str = "conversation",
+    timeout_s: float = 30.0,
+) -> Dict[str, Any]:
+    result = await call(
+        base_url,
+        token,
+        {
+            "type": "homeassistant/expose_new_entities/get",
+            "id": 1,
+            "assistant": _text(assistant) or "conversation",
+        },
+        timeout_s=timeout_s,
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def _registry_entity_map(value: Any) -> Dict[str, Dict[str, Any]]:
+    if isinstance(value, dict):
+        return {
+            _text(entity_id): dict(row)
+            for entity_id, row in value.items()
+            if _text(entity_id) and isinstance(row, dict)
+        }
+    if isinstance(value, list):
+        return {
+            _text(row.get("entity_id")): dict(row)
+            for row in value
+            if isinstance(row, dict) and _text(row.get("entity_id"))
+        }
+    return {}
+
+
+async def assist_exposure_policy(
+    base_url: Any,
+    token: Any,
+    *,
+    registry_entities: Any = None,
+    timeout_s: float = 30.0,
+) -> Dict[str, Any]:
+    """Load enough data to mirror Home Assistant's effective Assist exposure."""
+    jobs = [
+        exposed_entity_list(base_url, token, timeout_s=timeout_s),
+        expose_new_entities_get(base_url, token, timeout_s=timeout_s),
+    ]
+    if registry_entities is None:
+        jobs.append(entity_registry_list(base_url, token, timeout_s=timeout_s))
+    try:
+        results = await asyncio.gather(*jobs)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not read Home Assistant's Assist exposure settings. "
+            "Use a Home Assistant administrator token. "
+            f"{exc}"
+        ) from exc
+    exposed_result = results[0] if isinstance(results[0], dict) else {}
+    expose_new_result = results[1] if isinstance(results[1], dict) else {}
+    registry_rows = registry_entities if registry_entities is not None else results[2]
+
+    exposed_map = exposed_result.get("exposed_entities")
+    if not isinstance(exposed_map, dict):
+        exposed_map = {}
+    explicitly_exposed = {
+        _text(entity_id)
+        for entity_id, assistants in exposed_map.items()
+        if _text(entity_id)
+        and isinstance(assistants, dict)
+        and _bool(assistants.get("conversation"), False)
+    }
+    registry_map = _registry_entity_map(registry_rows)
+    explicitly_unexposed: set[str] = set()
+    for entity_id, entry in registry_map.items():
+        options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+        conversation = options.get("conversation") if isinstance(options.get("conversation"), dict) else {}
+        if "should_expose" in conversation and not _bool(conversation.get("should_expose"), False):
+            explicitly_unexposed.add(entity_id)
+
+    policy = {
+        "assistant": "conversation",
+        "expose_new": _bool(expose_new_result.get("expose_new"), True),
+        "explicitly_exposed": explicitly_exposed,
+        "explicitly_unexposed": explicitly_unexposed,
+        "registry_entities": registry_map,
+    }
+    with _ASSIST_POLICY_CACHE_LOCK:
+        _ASSIST_POLICY_CACHE.update(
+            {
+                "base": _text(base_url).rstrip("/"),
+                "token": _text(token),
+                "policy": policy,
+                "loaded_at": time.monotonic(),
+                "retry_at": 0.0,
+                "error": "",
+            }
+        )
+    return policy
+
+
+async def _cached_assist_exposure_policy(
+    base_url: Any,
+    token: Any,
+    *,
+    timeout_s: float = 12.0,
+) -> Dict[str, Any]:
+    base = _text(base_url).rstrip("/")
+    bearer = _text(token)
+    now = time.monotonic()
+    stale_policy: Optional[Dict[str, Any]] = None
+    with _ASSIST_POLICY_CACHE_LOCK:
+        same_connection = _ASSIST_POLICY_CACHE.get("base") == base and _ASSIST_POLICY_CACHE.get("token") == bearer
+        cached = _ASSIST_POLICY_CACHE.get("policy") if same_connection else None
+        if isinstance(cached, dict) and cached:
+            stale_policy = cached
+            if now - float(_ASSIST_POLICY_CACHE.get("loaded_at") or 0.0) < HOMEASSISTANT_ASSIST_POLICY_CACHE_SECONDS:
+                return cached
+        retry_at = float(_ASSIST_POLICY_CACHE.get("retry_at") or 0.0) if same_connection else 0.0
+        cached_error = _text(_ASSIST_POLICY_CACHE.get("error")) if same_connection else ""
+    if retry_at > now:
+        if stale_policy is not None:
+            return stale_policy
+        raise RuntimeError(cached_error or "Home Assistant Assist exposure refresh is waiting to retry.")
+    try:
+        return await assist_exposure_policy(base, bearer, timeout_s=timeout_s)
+    except Exception as exc:
+        with _ASSIST_POLICY_CACHE_LOCK:
+            _ASSIST_POLICY_CACHE.update(
+                {
+                    "base": base,
+                    "token": bearer,
+                    "policy": stale_policy,
+                    "retry_at": now + HOMEASSISTANT_ASSIST_POLICY_CACHE_SECONDS,
+                    "error": str(exc),
+                }
+            )
+        if stale_policy is not None:
+            return stale_policy
+        raise
+
+
+def _homeassistant_default_assist_exposure(
+    entity_id: Any,
+    attributes: Optional[Dict[str, Any]] = None,
+    registry_entry: Optional[Dict[str, Any]] = None,
+) -> bool:
+    entity = _text(entity_id)
+    if not entity:
+        return False
+    entry = registry_entry if isinstance(registry_entry, dict) else {}
+    if entry and (entry.get("entity_category") not in (None, "") or entry.get("hidden_by") not in (None, "")):
+        return False
+    domain = entity.split(".", 1)[0] if "." in entity else ""
+    if domain in HOMEASSISTANT_ASSIST_DEFAULT_DOMAINS:
+        return True
+    attrs = attributes if isinstance(attributes, dict) else {}
+    device_class = _text(
+        attrs.get("device_class")
+        or entry.get("device_class")
+        or entry.get("original_device_class")
+    ).lower()
+    if domain == "binary_sensor":
+        return device_class in HOMEASSISTANT_ASSIST_DEFAULT_BINARY_SENSOR_DEVICE_CLASSES
+    if domain == "sensor":
+        return device_class in HOMEASSISTANT_ASSIST_DEFAULT_SENSOR_DEVICE_CLASSES
+    return False
+
+
+def homeassistant_entity_in_scope(
+    entity_id: Any,
+    attributes: Optional[Dict[str, Any]] = None,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    assist_policy: Optional[Dict[str, Any]] = None,
+) -> bool:
+    conf = config if isinstance(config, dict) else {}
+    if normalize_homeassistant_entity_scope(conf.get("entity_scope")) != HOMEASSISTANT_ENTITY_SCOPE_ASSIST:
+        return True
+    entity = _text(entity_id)
+    policy = assist_policy if isinstance(assist_policy, dict) else {}
+    if not entity or not policy:
+        return False
+    explicitly_unexposed = policy.get("explicitly_unexposed") or set()
+    if entity in explicitly_unexposed:
+        return False
+    explicitly_exposed = policy.get("explicitly_exposed") or set()
+    if entity in explicitly_exposed:
+        return True
+    if not _bool(policy.get("expose_new"), True):
+        return False
+    registry_entities = policy.get("registry_entities") if isinstance(policy.get("registry_entities"), dict) else {}
+    return _homeassistant_default_assist_exposure(
+        entity,
+        attributes,
+        registry_entities.get(entity),
+    )
+
+
+def _homeassistant_runtime_entity(payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    row = payload if isinstance(payload, dict) else {}
+    new_state = row.get("new_state") if isinstance(row.get("new_state"), dict) else {}
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    entity_id = _text(
+        row.get("entity_id")
+        or row.get("ref")
+        or new_state.get("entity_id")
+        or raw.get("entity_id")
+    )
+    attributes = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+    if not attributes and isinstance(new_state.get("attributes"), dict):
+        attributes = new_state.get("attributes")
+    if not attributes and isinstance(raw.get("attributes"), dict):
+        attributes = raw.get("attributes")
+    return entity_id, attributes
+
+
+async def integration_runtime_event_allowed(
+    *,
+    kind: Any,
+    payload: Dict[str, Any],
+    client: Any = None,
+) -> bool:
+    """Filter live runtime data through the integration-owned entity scope."""
+    del kind
+    config = load_homeassistant_config(required=False, client=client)
+    if normalize_homeassistant_entity_scope(config.get("entity_scope")) != HOMEASSISTANT_ENTITY_SCOPE_ASSIST:
+        return True
+    entity_id, attributes = _homeassistant_runtime_entity(payload)
+    if not entity_id:
+        return False
+    policy = await _cached_assist_exposure_policy(
+        config.get("base"),
+        config.get("token"),
+    )
+    return homeassistant_entity_in_scope(
+        entity_id,
+        attributes,
+        config=config,
+        assist_policy=policy,
+    )
+
+
 async def call_service(
     base_url: Any,
     token: Any,
@@ -304,6 +712,44 @@ def device_registry_list_sync(base_url: Any, token: Any, *, timeout_s: float = 3
 def area_registry_list_sync(base_url: Any, token: Any, *, timeout_s: float = 30.0) -> list[dict]:
     return _run_sync(
         area_registry_list(base_url, token, timeout_s=timeout_s)
+    )
+
+
+def exposed_entity_list_sync(base_url: Any, token: Any, *, timeout_s: float = 30.0) -> Dict[str, Any]:
+    return _run_sync(exposed_entity_list(base_url, token, timeout_s=timeout_s))
+
+
+def expose_new_entities_get_sync(
+    base_url: Any,
+    token: Any,
+    *,
+    assistant: str = "conversation",
+    timeout_s: float = 30.0,
+) -> Dict[str, Any]:
+    return _run_sync(
+        expose_new_entities_get(
+            base_url,
+            token,
+            assistant=assistant,
+            timeout_s=timeout_s,
+        )
+    )
+
+
+def assist_exposure_policy_sync(
+    base_url: Any,
+    token: Any,
+    *,
+    registry_entities: Any = None,
+    timeout_s: float = 30.0,
+) -> Dict[str, Any]:
+    return _run_sync(
+        assist_exposure_policy(
+            base_url,
+            token,
+            registry_entities=registry_entities,
+            timeout_s=timeout_s,
+        )
     )
 
 
@@ -589,7 +1035,12 @@ def _homeassistant_entity_actions(entity_id: str, capabilities: list[str]) -> li
     return []
 
 
-def _homeassistant_registry_context(base: str, token: str) -> Dict[str, Dict[str, Any]]:
+def _homeassistant_registry_context(
+    base: str,
+    token: str,
+    *,
+    require_entities: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     context: Dict[str, Dict[str, Any]] = {
         "entities": {},
         "devices": {},
@@ -621,7 +1072,8 @@ def _homeassistant_registry_context(base: str, token: str) -> Dict[str, Dict[str
             if isinstance(row, dict) and _text(row.get("entity_id"))
         }
     except Exception:
-        pass
+        if require_entities:
+            raise
     return context
 
 
@@ -650,8 +1102,38 @@ def integration_devices() -> Dict[str, Any]:
     if not token:
         return {"devices": [], "message": "Home Assistant is not configured."}
     states = _homeassistant_rest_get(base, token, "/api/states", timeout_s=20.0)
-    registry_context = _homeassistant_registry_context(base, token)
+    entity_scope = normalize_homeassistant_entity_scope(config.get("entity_scope"))
+    try:
+        registry_context = _homeassistant_registry_context(
+            base,
+            token,
+            require_entities=entity_scope == HOMEASSISTANT_ENTITY_SCOPE_ASSIST,
+        )
+    except Exception as exc:
+        message = (
+            "Tater could not read Home Assistant's entity and Assist exposure settings. "
+            "Assist-only mode requires a Home Assistant administrator token. "
+            f"{exc}"
+        )
+        return {"devices": [], "error": message, "message": message}
+    assist_policy: Optional[Dict[str, Any]] = None
+    if entity_scope == HOMEASSISTANT_ENTITY_SCOPE_ASSIST:
+        try:
+            assist_policy = assist_exposure_policy_sync(
+                base,
+                token,
+                registry_entities=registry_context.get("entities"),
+                timeout_s=12.0,
+            )
+        except Exception as exc:
+            message = (
+                "Tater could not read Home Assistant's Assist exposure settings. "
+                "Assist-only mode requires a Home Assistant administrator token. "
+                f"{exc}"
+            )
+            return {"devices": [], "error": message, "message": message}
     devices: list[dict] = []
+    state_count = 0
     for row in states if isinstance(states, list) else []:
         if not isinstance(row, dict):
             continue
@@ -659,6 +1141,14 @@ def integration_devices() -> Dict[str, Any]:
         if not entity_id:
             continue
         attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+        state_count += 1
+        if not homeassistant_entity_in_scope(
+            entity_id,
+            attrs,
+            config=config,
+            assist_policy=assist_policy,
+        ):
+            continue
         domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
         state = _text(row.get("state"))
         capabilities = _homeassistant_entity_capabilities(entity_id, attrs)
@@ -681,6 +1171,13 @@ def integration_devices() -> Dict[str, Any]:
                 "details": _homeassistant_entity_details(row),
             }
         )
+    if entity_scope == HOMEASSISTANT_ENTITY_SCOPE_ASSIST:
+        return {
+            "devices": devices,
+            "message": (
+                f"Home Assistant returned {len(devices)} of {state_count} current entities exposed to Assist."
+            ),
+        }
     return {"devices": devices, "message": f"Home Assistant returned {len(devices)} current entities."}
 
 

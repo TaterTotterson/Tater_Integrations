@@ -41,9 +41,9 @@
       "id": "homeassistant",
       "name": "Home Assistant",
       "description": "Shared Home Assistant endpoint and token for devices, camera snapshots and short camera clips.",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "entry": "integrations/homeassistant.py",
-      "sha256": "0e1813070e94a919f2798c4f945903fea3aa12eba931d8a4c7e91db7cb0eea5c",
+      "sha256": "54a924a7044d7d75c2e200b7f0c6a3d7d65e20256bb6179dbedecd329e45a253",
       "required": false,
       "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "video_clip", "cover", "climate", "media_player", "remote", "scene", "script"]
     },
