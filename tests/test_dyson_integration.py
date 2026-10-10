@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import socket
 import sys
@@ -105,6 +106,22 @@ class DysonSettingsTests(unittest.TestCase):
         error = dyson._configuration_error(configured_settings(DYSON_CREDENTIAL=""))
 
         self.assertIn("device password", error)
+
+    def test_integration_metadata_can_be_read_while_disabled(self) -> None:
+        module_ast = ast.parse((REPO_ROOT / "integrations" / "dyson.py").read_text())
+        definition = {}
+        for node in module_ast.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == "INTEGRATION"
+                for target in node.targets
+            ):
+                definition = ast.literal_eval(node.value)
+                break
+
+        self.assertEqual(definition["id"], "dyson")
+        self.assertGreater(len(definition["fields"]), 0)
 
 
 class DysonMqttProtocolTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import atexit
 import contextlib
@@ -32,7 +32,7 @@ INTEGRATION = {
     "description": "Direct local Dyson fan and purifier sensor readings and controls over MQTT.",
     "badge": "DY",
     "order": 45,
-    "runtime_poll_seconds": DYSON_RUNTIME_POLL_SECONDS,
+    "runtime_poll_seconds": 30,
     "capabilities": [
         "fan",
         "switch",
@@ -46,7 +46,7 @@ INTEGRATION = {
             "key": "dyson_enabled",
             "label": "Enable Dyson",
             "type": "checkbox",
-            "default": DYSON_DEFAULT_ENABLED,
+            "default": True,
         },
         {
             "key": "dyson_serial_number",
@@ -116,7 +116,7 @@ INTEGRATION = {
             "key": "dyson_timeout_seconds",
             "label": "Connection Timeout Seconds",
             "type": "number",
-            "default": DYSON_DEFAULT_TIMEOUT_SECONDS,
+            "default": 8,
             "min": 2,
             "max": 30,
         },
