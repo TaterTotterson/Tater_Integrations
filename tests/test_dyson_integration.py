@@ -72,15 +72,48 @@ class FakeDysonClient:
         self.product_state.update(command)
 
 
+class FakeDysonCloudSession:
+    def __init__(self, devices):
+        self.email = "owner@example.com"
+        self.country = "US"
+        self.culture = "en-US"
+        self.challenge_id = ""
+        self._devices = list(devices)
+        self.provision_count = 0
+        self.completed = None
+
+    def provision(self):
+        self.provision_count += 1
+
+    def request_otp(self):
+        self.challenge_id = "challenge-123"
+        return self.challenge_id
+
+    def complete_login(self, *, challenge_id, password, otp):
+        self.completed = {
+            "challenge_id": challenge_id,
+            "password": password,
+            "otp": otp,
+        }
+
+    def devices(self):
+        return list(self._devices)
+
+
 class DysonSettingsTests(unittest.TestCase):
     def tearDown(self) -> None:
         dyson._shutdown_clients()
+        with dyson._cloud_sessions_lock:
+            dyson._cloud_sessions.clear()
 
     def test_settings_round_trip(self) -> None:
         store = FakeRedis()
 
         result = dyson.save_dyson_settings(
             enabled=True,
+            cloud_email="owner@example.com",
+            cloud_country="us",
+            cloud_culture="en-US",
             serial_number="VS6-US-TEST1234",
             host="192.0.2.42",
             credential="secret",
@@ -98,6 +131,8 @@ class DysonSettingsTests(unittest.TestCase):
 
         self.assertEqual(result["DYSON_SERIAL_NUMBER"], "VS6-US-TEST1234")
         self.assertEqual(result["DYSON_CREDENTIAL"], "secret")
+        self.assertEqual(result["DYSON_CLOUD_EMAIL"], "owner@example.com")
+        self.assertEqual(result["DYSON_CLOUD_COUNTRY"], "US")
         self.assertIn("HP07-US-SECOND01", result["DYSON_ADDITIONAL_DEVICES"])
         self.assertIn("second-secret", result["DYSON_ADDITIONAL_CREDENTIALS"])
         self.assertEqual(result["DYSON_TIMEOUT_SECONDS"], "30")
@@ -122,6 +157,106 @@ class DysonSettingsTests(unittest.TestCase):
 
         self.assertEqual(definition["id"], "dyson")
         self.assertGreater(len(definition["fields"]), 0)
+
+    def test_settings_never_save_cloud_password_or_otp(self) -> None:
+        store = FakeRedis()
+        with patch.object(dyson, "redis_client", store):
+            values = dyson.save_integration_settings(
+                {
+                    "dyson_enabled": False,
+                    "dyson_cloud_email": "owner@example.com",
+                    "dyson_cloud_password": "account-secret",
+                    "dyson_cloud_country": "US",
+                    "dyson_cloud_culture": "en-US",
+                    "dyson_cloud_otp": "123456",
+                }
+            )
+
+        stored = json.dumps(store.hashes)
+        self.assertNotIn("account-secret", stored)
+        self.assertNotIn("123456", stored)
+        self.assertEqual(values["dyson_cloud_password"], "")
+        self.assertEqual(values["dyson_cloud_otp"], "")
+
+    def test_cloud_otp_import_populates_all_compatible_fans(self) -> None:
+        store = FakeRedis()
+        manifest = [
+            {
+                "serialNumber": "475-US-PRIMARY01",
+                "name": "Living Room Dyson",
+                "category": "ec",
+                "connectionCategory": "wifiOnly",
+                "connectedConfiguration": {
+                    "mqtt": {
+                        "localBrokerCredentials": "encrypted-primary",
+                        "mqttRootTopicLevel": "475",
+                    }
+                },
+            },
+            {
+                "serialNumber": "527-US-SECOND02",
+                "name": "Bedroom Dyson",
+                "category": "ec",
+                "connectionCategory": "lecAndWifi",
+                "connectedConfiguration": {
+                    "mqtt": {
+                        "localBrokerCredentials": "encrypted-secondary",
+                        "mqttRootTopicLevel": "527",
+                    }
+                },
+            },
+            {
+                "serialNumber": "ROBOT-US-SKIP03",
+                "name": "Robot",
+                "category": "robot",
+                "connectionCategory": "wifiOnly",
+                "connectedConfiguration": {},
+            },
+        ]
+        cloud = FakeDysonCloudSession(manifest)
+        payload = {
+            "dyson_cloud_email": "owner@example.com",
+            "dyson_cloud_password": "account-secret",
+            "dyson_cloud_country": "US",
+            "dyson_cloud_culture": "en-US",
+            "dyson_cloud_otp": "123456",
+            "dyson_timeout_seconds": 8,
+        }
+        credentials = {
+            "encrypted-primary": "local-primary",
+            "encrypted-secondary": "local-secondary",
+        }
+
+        with (
+            patch.object(dyson, "redis_client", store),
+            patch.object(dyson, "_DysonCloudSession", return_value=cloud),
+            patch.object(
+                dyson,
+                "_decrypt_local_credential",
+                side_effect=lambda encrypted, _serial: credentials[encrypted],
+            ),
+        ):
+            requested = dyson.run_integration_action("cloud_request_otp", payload)
+            imported = dyson.run_integration_action("cloud_import", payload)
+
+        settings = dyson.read_dyson_settings(store)
+        stored = json.dumps(store.hashes)
+        self.assertTrue(requested["ok"])
+        self.assertTrue(imported["ok"])
+        self.assertEqual(settings["DYSON_SERIAL_NUMBER"], "475-US-PRIMARY01")
+        self.assertEqual(settings["DYSON_CREDENTIAL"], "local-primary")
+        self.assertEqual(settings["DYSON_MQTT_PREFIX"], "475")
+        self.assertIn("527-US-SECOND02", settings["DYSON_ADDITIONAL_DEVICES"])
+        self.assertIn(
+            "527-US-SECOND02=local-secondary",
+            settings["DYSON_ADDITIONAL_CREDENTIALS"],
+        )
+        self.assertEqual(len(imported["imported"]), 2)
+        self.assertEqual(len(imported["warnings"]), 1)
+        self.assertNotIn("account-secret", stored)
+        self.assertNotIn("123456", stored)
+        self.assertEqual(imported["values"]["dyson_cloud_password"], "")
+        self.assertEqual(imported["values"]["dyson_cloud_otp"], "")
 
 
 class DysonMqttProtocolTests(unittest.TestCase):

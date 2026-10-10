@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 import atexit
+import base64
 import contextlib
+import http.cookiejar
 import json
 import math
 import socket
@@ -12,7 +14,9 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from helpers import redis_client
 
@@ -23,13 +27,14 @@ DYSON_DEFAULT_PORT = 1883
 DYSON_DEFAULT_TIMEOUT_SECONDS = 8
 DYSON_RUNTIME_POLL_SECONDS = 30
 DYSON_LEGACY_FILTER_LIFE_HOURS = 4300
+DYSON_CLOUD_CHALLENGE_TTL_SECONDS = 10 * 60
 
 INTEGRATION_RUNTIME_POLL_SECONDS = DYSON_RUNTIME_POLL_SECONDS
 
 INTEGRATION = {
     "id": "dyson",
     "name": "Dyson",
-    "description": "Direct local Dyson fan and purifier sensor readings and controls over MQTT.",
+    "description": "Local Dyson fan and purifier control with optional account-assisted setup.",
     "badge": "DY",
     "order": 45,
     "runtime_poll_seconds": 30,
@@ -47,6 +52,45 @@ INTEGRATION = {
             "label": "Enable Dyson",
             "type": "checkbox",
             "default": True,
+        },
+        {
+            "key": "dyson_cloud_email",
+            "label": "Dyson Account Email (Setup Only)",
+            "type": "text",
+            "default": "",
+            "placeholder": "you@example.com",
+            "description": "Optional. Used with the setup actions below to import every compatible fan from your Dyson account.",
+        },
+        {
+            "key": "dyson_cloud_password",
+            "label": "Dyson Account Password (Never Saved)",
+            "type": "password",
+            "default": "",
+            "description": "Used only to finish Dyson login after the email OTP arrives. Tater never stores this value.",
+        },
+        {
+            "key": "dyson_cloud_country",
+            "label": "Dyson Account Country Code",
+            "type": "text",
+            "default": "US",
+            "placeholder": "US",
+            "description": "Two-letter country code, such as US, GB, CA, or AU.",
+        },
+        {
+            "key": "dyson_cloud_culture",
+            "label": "Dyson Account Locale",
+            "type": "text",
+            "default": "en-US",
+            "placeholder": "en-US",
+            "description": "Language and country locale, such as en-US or en-GB.",
+        },
+        {
+            "key": "dyson_cloud_otp",
+            "label": "Email One-Time Password (Never Saved)",
+            "type": "password",
+            "default": "",
+            "placeholder": "123456",
+            "description": "First select Send Dyson OTP, then enter the code from Dyson and select Import Fans.",
         },
         {
             "key": "dyson_serial_number",
@@ -123,6 +167,16 @@ INTEGRATION = {
     ],
     "actions": [
         {
+            "id": "cloud_request_otp",
+            "label": "Send Dyson OTP",
+            "status": "Requests a one-time login code from Dyson for account-assisted setup.",
+        },
+        {
+            "id": "cloud_import",
+            "label": "Import Fans from Dyson Account",
+            "status": "Uses the OTP once to discover fans and save only their local connection credentials.",
+        },
+        {
             "id": "test",
             "label": "Test Dyson",
             "status": "Connects directly to the configured Dyson and requests its current state.",
@@ -140,6 +194,12 @@ def _text(value: Any) -> str:
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", "ignore").strip()
     return str(value or "").strip()
+
+
+def _secret_text(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "ignore")
+    return "" if value is None else str(value)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -223,6 +283,9 @@ def read_dyson_settings(client: Any = None) -> Dict[str, Any]:
     raw = _read_raw(client)
     return {
         "DYSON_ENABLED": _as_bool(raw.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED),
+        "DYSON_CLOUD_EMAIL": _text(raw.get("DYSON_CLOUD_EMAIL")),
+        "DYSON_CLOUD_COUNTRY": _text(raw.get("DYSON_CLOUD_COUNTRY")) or "US",
+        "DYSON_CLOUD_CULTURE": _text(raw.get("DYSON_CLOUD_CULTURE")) or "en-US",
         "DYSON_SERIAL_NUMBER": _text(raw.get("DYSON_SERIAL_NUMBER")),
         "DYSON_HOST": _text(raw.get("DYSON_HOST")),
         "DYSON_CREDENTIAL": _text(raw.get("DYSON_CREDENTIAL")),
@@ -245,6 +308,9 @@ def read_dyson_settings(client: Any = None) -> Dict[str, Any]:
 def save_dyson_settings(
     *,
     enabled: Any = None,
+    cloud_email: Any = None,
+    cloud_country: Any = None,
+    cloud_culture: Any = None,
     serial_number: Any = None,
     host: Any = None,
     credential: Any = None,
@@ -262,6 +328,21 @@ def save_dyson_settings(
         "DYSON_ENABLED": "true"
         if _as_bool(current.get("DYSON_ENABLED") if enabled is None else enabled, DYSON_DEFAULT_ENABLED)
         else "false",
+        "DYSON_CLOUD_EMAIL": _text(
+            current.get("DYSON_CLOUD_EMAIL") if cloud_email is None else cloud_email
+        ),
+        "DYSON_CLOUD_COUNTRY": _text(
+            current.get("DYSON_CLOUD_COUNTRY")
+            if cloud_country is None
+            else cloud_country
+        ).upper()
+        or "US",
+        "DYSON_CLOUD_CULTURE": _text(
+            current.get("DYSON_CLOUD_CULTURE")
+            if cloud_culture is None
+            else cloud_culture
+        )
+        or "en-US",
         "DYSON_SERIAL_NUMBER": _text(
             current.get("DYSON_SERIAL_NUMBER") if serial_number is None else serial_number
         ),
@@ -296,6 +377,514 @@ def save_dyson_settings(
     store.hset(DYSON_SETTINGS_KEY, mapping=next_settings)
     _shutdown_clients()
     return read_dyson_settings(store)
+
+
+def _cloud_identity(
+    email: Any,
+    country: Any,
+    culture: Any,
+) -> Tuple[str, str, str]:
+    account_email = _text(email)
+    account_country = (_text(country) or "US").upper()
+    account_culture = _text(culture) or "en-US"
+    if "@" not in account_email or account_email.startswith("@") or account_email.endswith("@"):
+        raise ValueError("A valid Dyson account email address is required.")
+    if len(account_country) != 2 or not account_country.isalpha():
+        raise ValueError("Dyson country must be a two-letter code such as US or GB.")
+    if (
+        len(account_culture) != 5
+        or account_culture[2] != "-"
+        or not account_culture[:2].isalpha()
+        or not account_culture[3:].isalpha()
+    ):
+        raise ValueError("Dyson locale must use a value such as en-US or en-GB.")
+    account_culture = f"{account_culture[:2].lower()}-{account_culture[3:].upper()}"
+    return account_email, account_country, account_culture
+
+
+def _cloud_api_base(country: str) -> str:
+    return "https://appapi.cp.dyson.cn" if country == "CN" else "https://appapi.cp.dyson.com"
+
+
+class _DysonCloudSession:
+    def __init__(self, *, email: str, country: str, culture: str, timeout: int) -> None:
+        self.email = email
+        self.country = country
+        self.culture = culture
+        self.timeout = timeout
+        self.challenge_id = ""
+        self._token = ""
+        cookie_jar = http.cookiejar.CookieJar()
+        self._opener = build_opener(HTTPCookieProcessor(cookie_jar))
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        query = urlencode({key: value for key, value in (params or {}).items() if value is not None})
+        url = f"{_cloud_api_base(self.country)}{path}"
+        if query:
+            url = f"{url}?{query}"
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "android client",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        request = Request(url, data=body, headers=headers, method=method.upper())
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                response_body = response.read()
+        except HTTPError as exc:
+            if exc.code == 401:
+                raise ValueError("Dyson rejected the account password or one-time code.") from exc
+            if exc.code == 429:
+                raise ValueError("Dyson is rate-limiting login attempts. Wait a few minutes and try again.") from exc
+            raise RuntimeError(f"Dyson cloud request failed with HTTP {exc.code}.") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            reason = _text(getattr(exc, "reason", "")) or exc.__class__.__name__
+            raise RuntimeError(f"Could not reach the Dyson cloud service: {reason}.") from exc
+        if not response_body:
+            return {}
+        try:
+            return json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Dyson returned an unreadable cloud response.") from exc
+
+    def provision(self) -> None:
+        self._request("GET", "/v1/provisioningservice/application/Android/version")
+
+    def request_otp(self) -> str:
+        status = self._request(
+            "POST",
+            "/v3/userregistration/email/userstatus",
+            params={"country": self.country},
+            payload={"email": self.email},
+        )
+        if isinstance(status, dict) and _text(status.get("accountStatus")).upper() not in {"", "ACTIVE"}:
+            raise ValueError("That Dyson account is not active or registered.")
+        challenge = self._request(
+            "POST",
+            "/v3/userregistration/email/auth",
+            params={"country": self.country, "culture": self.culture},
+            payload={"email": self.email},
+        )
+        challenge_id = _text(challenge.get("challengeId")) if isinstance(challenge, dict) else ""
+        if not challenge_id:
+            raise RuntimeError("Dyson did not return a login challenge.")
+        self.challenge_id = challenge_id
+        return challenge_id
+
+    def complete_login(self, *, challenge_id: str, password: str, otp: str) -> None:
+        login = self._request(
+            "POST",
+            "/v3/userregistration/email/verify",
+            params={"country": self.country, "culture": self.culture},
+            payload={
+                "challengeId": challenge_id,
+                "email": self.email,
+                "otpCode": otp,
+                "password": password,
+            },
+        )
+        token = _text(login.get("token")) if isinstance(login, dict) else ""
+        if not token:
+            raise ValueError("Dyson login did not return an access token. Check the password and OTP.")
+        self._token = token
+
+    def devices(self) -> List[Dict[str, Any]]:
+        manifest = self._request("GET", "/v3/manifest")
+        if not isinstance(manifest, list):
+            raise RuntimeError("Dyson returned an invalid device list.")
+        return [dict(item) for item in manifest if isinstance(item, dict)]
+
+
+_cloud_sessions_lock = threading.RLock()
+_cloud_sessions: Dict[str, _DysonCloudSession] = {}
+
+
+def _save_cloud_challenge(
+    *,
+    email: str,
+    country: str,
+    culture: str,
+    challenge_id: str,
+    client: Any = None,
+) -> None:
+    store = client or redis_client
+    store.hset(
+        DYSON_SETTINGS_KEY,
+        mapping={
+            "DYSON_CLOUD_CHALLENGE_ID": challenge_id,
+            "DYSON_CLOUD_CHALLENGE_EMAIL": email,
+            "DYSON_CLOUD_CHALLENGE_COUNTRY": country,
+            "DYSON_CLOUD_CHALLENGE_CULTURE": culture,
+            "DYSON_CLOUD_CHALLENGE_EXPIRES_AT": str(
+                int(time.time()) + DYSON_CLOUD_CHALLENGE_TTL_SECONDS
+            ),
+        },
+    )
+
+
+def _clear_cloud_challenge(client: Any = None) -> None:
+    store = client or redis_client
+    with contextlib.suppress(Exception):
+        store.hset(
+            DYSON_SETTINGS_KEY,
+            mapping={
+                "DYSON_CLOUD_CHALLENGE_ID": "",
+                "DYSON_CLOUD_CHALLENGE_EMAIL": "",
+                "DYSON_CLOUD_CHALLENGE_COUNTRY": "",
+                "DYSON_CLOUD_CHALLENGE_CULTURE": "",
+                "DYSON_CLOUD_CHALLENGE_EXPIRES_AT": "",
+            },
+        )
+
+
+def _load_cloud_challenge(
+    *,
+    email: str,
+    country: str,
+    culture: str,
+    client: Any = None,
+) -> str:
+    raw = _read_raw(client)
+    challenge_id = _text(raw.get("DYSON_CLOUD_CHALLENGE_ID"))
+    challenge_email = _text(raw.get("DYSON_CLOUD_CHALLENGE_EMAIL"))
+    challenge_country = _text(raw.get("DYSON_CLOUD_CHALLENGE_COUNTRY"))
+    challenge_culture = _text(raw.get("DYSON_CLOUD_CHALLENGE_CULTURE"))
+    try:
+        expires_at = int(float(_text(raw.get("DYSON_CLOUD_CHALLENGE_EXPIRES_AT"))))
+    except (TypeError, ValueError):
+        expires_at = 0
+    if (
+        not challenge_id
+        or challenge_email.casefold() != email.casefold()
+        or challenge_country != country
+        or challenge_culture != culture
+        or expires_at <= int(time.time())
+    ):
+        raise ValueError("Send a new Dyson OTP before importing devices.")
+    return challenge_id
+
+
+def _decrypt_local_credential(encrypted_password: Any, serial_number: Any) -> str:
+    encrypted = _text(encrypted_password)
+    serial = _text(serial_number)
+    if not encrypted:
+        raise ValueError(f"Dyson {serial or 'device'} has no local MQTT credential.")
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tater needs its cryptography dependency installed to import Dyson credentials."
+        ) from exc
+    try:
+        ciphertext = base64.b64decode(encrypted, validate=True)
+        decryptor = Cipher(
+            algorithms.AES(bytes(range(1, 33))),
+            modes.CBC(bytes(16)),
+        ).decryptor()
+        decrypted = decryptor.update(ciphertext) + decryptor.finalize()
+        decoded = decrypted.decode("utf-8").rstrip("\b").rstrip("\x00")
+        password_data, _end = json.JSONDecoder().raw_decode(decoded)
+        password = _text(password_data.get("apPasswordHash")) if isinstance(password_data, dict) else ""
+    except Exception as exc:
+        raise RuntimeError(f"Could not decrypt the local credential for Dyson {serial}.") from exc
+    if not password:
+        raise RuntimeError(f"Dyson {serial} did not provide a usable local credential.")
+    return password
+
+
+def _cloud_fan_devices(manifest: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], List[str]]:
+    devices: List[Dict[str, str]] = []
+    warnings: List[str] = []
+    for item in manifest:
+        serial = _text(item.get("serialNumber"))
+        name = _text(item.get("name")) or (f"Dyson {serial}" if serial else "Dyson")
+        category = _text(item.get("category")).lower()
+        connection = _text(item.get("connectionCategory"))
+        configuration = item.get("connectedConfiguration")
+        configuration = configuration if isinstance(configuration, dict) else {}
+        mqtt = configuration.get("mqtt")
+        mqtt = mqtt if isinstance(mqtt, dict) else {}
+        mqtt_prefix = _text(mqtt.get("mqttRootTopicLevel"))
+        encrypted = _text(mqtt.get("localBrokerCredentials"))
+        if category != "ec":
+            if serial:
+                warnings.append(f"Skipped {name}: category {category or 'unknown'} is not a fan or purifier.")
+            continue
+        if connection in {"lecOnly", "nonConnected"} or not encrypted or not mqtt_prefix or not serial:
+            warnings.append(f"Skipped {name}: Dyson did not provide local Wi-Fi MQTT details.")
+            continue
+        try:
+            credential = _decrypt_local_credential(encrypted, serial)
+        except Exception as exc:
+            warnings.append(f"Skipped {name}: {_text(exc)}")
+            continue
+        devices.append(
+            {
+                "serial": serial,
+                "host": "",
+                "credential": credential,
+                "mqtt_prefix": mqtt_prefix,
+                "name": name,
+                "room": "",
+            }
+        )
+    return devices, warnings
+
+
+def _existing_device_rows(settings: Dict[str, Any]) -> List[Dict[str, str]]:
+    credentials: Dict[str, str] = {}
+    for raw_entry in _text(settings.get("DYSON_ADDITIONAL_CREDENTIALS")).replace(";", "\n").splitlines():
+        if "=" not in raw_entry:
+            continue
+        serial, credential = raw_entry.split("=", 1)
+        if _text(serial) and _text(credential):
+            credentials[_text(serial).casefold()] = _text(credential)
+    rows: List[Dict[str, str]] = []
+    primary = {
+        "serial": _text(settings.get("DYSON_SERIAL_NUMBER")),
+        "host": _text(settings.get("DYSON_HOST")),
+        "credential": _text(settings.get("DYSON_CREDENTIAL")),
+        "mqtt_prefix": _text(settings.get("DYSON_MQTT_PREFIX")),
+        "name": _text(settings.get("DYSON_NAME")),
+        "room": _text(settings.get("DYSON_ROOM")),
+    }
+    if primary["serial"] and primary["credential"] and primary["mqtt_prefix"]:
+        rows.append(primary)
+    for raw_line in _text(settings.get("DYSON_ADDITIONAL_DEVICES")).splitlines():
+        parts = [part.strip() for part in raw_line.split("|")]
+        if len(parts) < 3:
+            continue
+        serial = _text(parts[0])
+        row = {
+            "serial": serial,
+            "host": _text(parts[1]),
+            "credential": credentials.get(serial.casefold(), ""),
+            "mqtt_prefix": _text(parts[2]),
+            "name": _text(parts[3]) if len(parts) > 3 else "",
+            "room": _text(parts[4]) if len(parts) > 4 else "",
+        }
+        if row["serial"] and row["credential"] and row["mqtt_prefix"]:
+            rows.append(row)
+    return rows
+
+
+def _clean_device_label(value: Any) -> str:
+    return _text(value).replace("|", "-").replace("\r", " ").replace("\n", " ")
+
+
+def _save_cloud_devices(
+    discovered: List[Dict[str, str]],
+    *,
+    email: str,
+    country: str,
+    culture: str,
+    client: Any = None,
+) -> Dict[str, Any]:
+    store = client or redis_client
+    current = read_dyson_settings(store)
+    merged = _existing_device_rows(current)
+    by_serial = {row["serial"].casefold(): row for row in merged}
+    for cloud_device in discovered:
+        serial_key = cloud_device["serial"].casefold()
+        existing = by_serial.get(serial_key)
+        if existing is None:
+            existing = dict(cloud_device)
+            merged.append(existing)
+            by_serial[serial_key] = existing
+        else:
+            existing["credential"] = cloud_device["credential"]
+            existing["mqtt_prefix"] = cloud_device["mqtt_prefix"]
+            if not existing.get("name"):
+                existing["name"] = cloud_device["name"]
+    if not merged:
+        raise ValueError("No compatible Wi-Fi Dyson fans or purifiers were found in that account.")
+    primary, *additional = merged
+    additional_lines = [
+        " | ".join(
+            [
+                row["serial"],
+                row.get("host", ""),
+                row["mqtt_prefix"],
+                _clean_device_label(row.get("name")),
+                _clean_device_label(row.get("room")),
+            ]
+        )
+        for row in additional
+    ]
+    additional_credentials = "; ".join(
+        f"{row['serial']}={row['credential']}" for row in additional
+    )
+    return save_dyson_settings(
+        enabled=True,
+        cloud_email=email,
+        cloud_country=country,
+        cloud_culture=culture,
+        serial_number=primary["serial"],
+        host=primary.get("host", ""),
+        credential=primary["credential"],
+        mqtt_prefix=primary["mqtt_prefix"],
+        name=_clean_device_label(primary.get("name")),
+        room=_clean_device_label(primary.get("room")),
+        additional_devices="\n".join(additional_lines),
+        additional_credentials=additional_credentials,
+        client=store,
+    )
+
+
+def _request_cloud_otp(payload: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
+    store = client or redis_client
+    current = read_dyson_settings(store)
+    email, country, culture = _cloud_identity(
+        payload.get("dyson_cloud_email") or current.get("DYSON_CLOUD_EMAIL"),
+        payload.get("dyson_cloud_country") or current.get("DYSON_CLOUD_COUNTRY"),
+        payload.get("dyson_cloud_culture") or current.get("DYSON_CLOUD_CULTURE"),
+    )
+    timeout = _bounded_int(
+        payload.get("dyson_timeout_seconds", current.get("DYSON_TIMEOUT_SECONDS")),
+        default=DYSON_DEFAULT_TIMEOUT_SECONDS,
+        minimum=2,
+        maximum=30,
+    )
+    session = _DysonCloudSession(
+        email=email,
+        country=country,
+        culture=culture,
+        timeout=timeout,
+    )
+    session.provision()
+    challenge_id = session.request_otp()
+    save_dyson_settings(
+        cloud_email=email,
+        cloud_country=country,
+        cloud_culture=culture,
+        client=store,
+    )
+    _save_cloud_challenge(
+        email=email,
+        country=country,
+        culture=culture,
+        challenge_id=challenge_id,
+        client=store,
+    )
+    with _cloud_sessions_lock:
+        _cloud_sessions[email.casefold()] = session
+    return {
+        "ok": True,
+        "values": {
+            "dyson_cloud_email": email,
+            "dyson_cloud_country": country,
+            "dyson_cloud_culture": culture,
+            "dyson_cloud_otp": "",
+        },
+        "message": f"Dyson sent a one-time code to {email}. Enter it above, then select Import Fans.",
+    }
+
+
+def _import_cloud_devices(payload: Dict[str, Any], client: Any = None) -> Dict[str, Any]:
+    store = client or redis_client
+    current = read_dyson_settings(store)
+    email, country, culture = _cloud_identity(
+        payload.get("dyson_cloud_email") or current.get("DYSON_CLOUD_EMAIL"),
+        payload.get("dyson_cloud_country") or current.get("DYSON_CLOUD_COUNTRY"),
+        payload.get("dyson_cloud_culture") or current.get("DYSON_CLOUD_CULTURE"),
+    )
+    password = _secret_text(payload.get("dyson_cloud_password"))
+    otp = _text(payload.get("dyson_cloud_otp"))
+    if not password:
+        raise ValueError("Enter the Dyson account password. It will be used once and not saved.")
+    if not otp:
+        raise ValueError("Enter the one-time code Dyson sent by email.")
+    challenge_id = _load_cloud_challenge(
+        email=email,
+        country=country,
+        culture=culture,
+        client=store,
+    )
+    with _cloud_sessions_lock:
+        session = _cloud_sessions.get(email.casefold())
+    if (
+        session is None
+        or session.country != country
+        or session.culture != culture
+        or session.challenge_id != challenge_id
+    ):
+        timeout = _bounded_int(
+            payload.get("dyson_timeout_seconds", current.get("DYSON_TIMEOUT_SECONDS")),
+            default=DYSON_DEFAULT_TIMEOUT_SECONDS,
+            minimum=2,
+            maximum=30,
+        )
+        session = _DysonCloudSession(
+            email=email,
+            country=country,
+            culture=culture,
+            timeout=timeout,
+        )
+        session.provision()
+    session.complete_login(challenge_id=challenge_id, password=password, otp=otp)
+    try:
+        manifest = session.devices()
+        discovered, warnings = _cloud_fan_devices(manifest)
+        if not discovered:
+            detail = f" {' '.join(warnings)}" if warnings else ""
+            raise ValueError(
+                f"No compatible local-MQTT Dyson fans were found.{detail}".strip()
+            )
+        saved = _save_cloud_devices(
+            discovered,
+            email=email,
+            country=country,
+            culture=culture,
+            client=store,
+        )
+    finally:
+        _clear_cloud_challenge(store)
+        with _cloud_sessions_lock:
+            _cloud_sessions.pop(email.casefold(), None)
+    values = {
+        "dyson_enabled": _as_bool(saved.get("DYSON_ENABLED"), True),
+        "dyson_cloud_email": saved.get("DYSON_CLOUD_EMAIL", ""),
+        "dyson_cloud_password": "",
+        "dyson_cloud_country": saved.get("DYSON_CLOUD_COUNTRY", "US"),
+        "dyson_cloud_culture": saved.get("DYSON_CLOUD_CULTURE", "en-US"),
+        "dyson_cloud_otp": "",
+        "dyson_serial_number": saved.get("DYSON_SERIAL_NUMBER", ""),
+        "dyson_host": saved.get("DYSON_HOST", ""),
+        "dyson_credential": saved.get("DYSON_CREDENTIAL", ""),
+        "dyson_mqtt_prefix": saved.get("DYSON_MQTT_PREFIX", ""),
+        "dyson_name": saved.get("DYSON_NAME", ""),
+        "dyson_room": saved.get("DYSON_ROOM", ""),
+        "dyson_additional_devices": saved.get("DYSON_ADDITIONAL_DEVICES", ""),
+        "dyson_additional_credentials": saved.get("DYSON_ADDITIONAL_CREDENTIALS", ""),
+        "dyson_timeout_seconds": int(
+            saved.get("DYSON_TIMEOUT_SECONDS") or DYSON_DEFAULT_TIMEOUT_SECONDS
+        ),
+    }
+    warning_text = f" {len(warnings)} unsupported device(s) were skipped." if warnings else ""
+    return {
+        "ok": True,
+        "values": values,
+        "imported": [
+            {"serial_number": item["serial"], "name": item["name"]}
+            for item in discovered
+        ],
+        "warnings": warnings,
+        "message": (
+            f"Imported {len(discovered)} Dyson fan{'s' if len(discovered) != 1 else ''} "
+            f"for local control.{warning_text} Account password, OTP, token, and cloud session were not saved."
+        ),
+    }
 
 
 def _mqtt_utf8(value: Any) -> bytes:
@@ -990,6 +1579,11 @@ def read_integration_settings() -> Dict[str, Any]:
     settings = read_dyson_settings()
     return {
         "dyson_enabled": _as_bool(settings.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED),
+        "dyson_cloud_email": settings.get("DYSON_CLOUD_EMAIL", ""),
+        "dyson_cloud_password": "",
+        "dyson_cloud_country": settings.get("DYSON_CLOUD_COUNTRY", "US"),
+        "dyson_cloud_culture": settings.get("DYSON_CLOUD_CULTURE", "en-US"),
+        "dyson_cloud_otp": "",
         "dyson_serial_number": settings.get("DYSON_SERIAL_NUMBER", ""),
         "dyson_host": settings.get("DYSON_HOST", ""),
         "dyson_credential": settings.get("DYSON_CREDENTIAL", ""),
@@ -1006,6 +1600,9 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = payload or {}
     saved = save_dyson_settings(
         enabled=data.get("dyson_enabled"),
+        cloud_email=data.get("dyson_cloud_email"),
+        cloud_country=data.get("dyson_cloud_country"),
+        cloud_culture=data.get("dyson_cloud_culture"),
         serial_number=data.get("dyson_serial_number"),
         host=data.get("dyson_host"),
         credential=data.get("dyson_credential"),
@@ -1018,6 +1615,11 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     return {
         "dyson_enabled": _as_bool(saved.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED),
+        "dyson_cloud_email": saved.get("DYSON_CLOUD_EMAIL", ""),
+        "dyson_cloud_password": "",
+        "dyson_cloud_country": saved.get("DYSON_CLOUD_COUNTRY", "US"),
+        "dyson_cloud_culture": saved.get("DYSON_CLOUD_CULTURE", "en-US"),
+        "dyson_cloud_otp": "",
         "dyson_serial_number": saved.get("DYSON_SERIAL_NUMBER", ""),
         "dyson_host": saved.get("DYSON_HOST", ""),
         "dyson_credential": saved.get("DYSON_CREDENTIAL", ""),
@@ -1123,6 +1725,10 @@ def integration_devices() -> Dict[str, Any]:
 
 def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     action = _text(action_id).lower()
+    if action == "cloud_request_otp":
+        return _request_cloud_otp(payload or {})
+    if action == "cloud_import":
+        return _import_cloud_devices(payload or {})
     if action not in {"test", "refresh"}:
         raise KeyError(f"Unsupported Dyson action: {action_id}")
     if payload:

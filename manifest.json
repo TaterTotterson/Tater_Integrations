@@ -28,10 +28,10 @@
     {
       "id": "dyson",
       "name": "Dyson",
-      "description": "Direct local Dyson fan and purifier sensor readings and controls over MQTT.",
-      "version": "1.0.1",
+      "description": "Local Dyson fan and purifier control with optional account-assisted setup.",
+      "version": "1.1.0",
       "entry": "integrations/dyson.py",
-      "sha256": "149498ceb7dc5cf4b598013eec9b2b64d22008671e480b2896b8055824f54b70",
+      "sha256": "34f61861c555cc9ef0b8f0065008dc05856a56e05bbb28a86b74f9a7fc52677b",
       "required": false,
       "capabilities": ["fan", "switch", "sensor", "air_quality", "temperature", "humidity"],
       "redis_hashes": ["dyson_settings"]
