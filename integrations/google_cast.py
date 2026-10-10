@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import contextlib
 import importlib
@@ -134,6 +134,7 @@ def _load_cast_dependencies(*, required: bool = True) -> Optional[Dict[str, Any]
         "CastBrowser": discovery.CastBrowser,
         "SimpleCastListener": pychromecast.SimpleCastListener,
         "Zeroconf": zeroconf.Zeroconf,
+        "app_media_receiver": pychromecast.APP_MEDIA_RECEIVER,
         "get_chromecast_from_host": pychromecast.get_chromecast_from_host,
         "stream_type_buffered": pychromecast.STREAM_TYPE_BUFFERED,
     }
@@ -603,6 +604,14 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
             volume = _volume_percent(data)
             if volume is not None:
                 cast.set_volume(volume / 100.0, timeout=timeout_s)
+            app_media_receiver = dependencies["app_media_receiver"]
+            current_app_id = _text(getattr(getattr(cast, "status", None), "app_id", ""))
+            if current_app_id != app_media_receiver:
+                cast.start_app(
+                    app_media_receiver,
+                    force_launch=True,
+                    timeout=timeout_s,
+                )
             current_time = max(0.0, float(data.get("start_position_seconds") or 0.0))
             controller.quick_play(
                 media_id=source_url,

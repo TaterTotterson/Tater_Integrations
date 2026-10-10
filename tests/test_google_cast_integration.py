@@ -98,11 +98,17 @@ class FakeMediaController:
 class FakeCast:
     def __init__(self) -> None:
         self.media_controller = FakeMediaController()
+        self.status = types.SimpleNamespace(app_id="2C6A6E3D")
         self.volume_calls: list[tuple[float, float]] = []
+        self.start_app_calls: list[tuple[str, bool, float]] = []
         self.disconnect_calls: list[float] = []
 
     def set_volume(self, level: float, *, timeout: float) -> None:
         self.volume_calls.append((level, timeout))
+
+    def start_app(self, app_id: str, *, force_launch: bool, timeout: float) -> None:
+        self.start_app_calls.append((app_id, force_launch, timeout))
+        self.status.app_id = app_id
 
     def disconnect(self, *, timeout: float) -> None:
         self.disconnect_calls.append(timeout)
@@ -160,7 +166,10 @@ class GoogleCastIntegrationTests(unittest.TestCase):
             "available": True,
         }
         cast = FakeCast()
-        dependencies = {"stream_type_buffered": "BUFFERED"}
+        dependencies = {
+            "app_media_receiver": "CC1AD845",
+            "stream_type_buffered": "BUFFERED",
+        }
         with (
             patch.object(google_cast, "resolve_google_cast_target", return_value=target),
             patch.object(google_cast, "_connect_cast", return_value=(cast, dependencies)),
@@ -178,6 +187,7 @@ class GoogleCastIntegrationTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(cast.volume_calls, [(0.42, 12.0)])
+        self.assertEqual(cast.start_app_calls, [("CC1AD845", True, 12.0)])
         self.assertEqual(len(cast.media_controller.quick_play_calls), 1)
         request = cast.media_controller.quick_play_calls[0]
         self.assertEqual(request["media_id"], "http://192.168.1.20:8501/runtime/song.mp3")
