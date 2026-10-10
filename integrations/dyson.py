@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import atexit
 import base64
@@ -1140,7 +1140,18 @@ class _DysonMQTTClient:
             self._connected.set()
             self._condition.notify_all()
 
-        self._subscribe(f"{self._topic_root}/#")
+        # Dyson's embedded MQTT broker accepts a connection but rejects a
+        # wildcard subscription with SUBACK 0x80 on several fan generations.
+        # Subscribe to the concrete status topics used by the Dyson app so
+        # current state and environmental readings are actually delivered.
+        for suffix in (
+            "status/current",
+            "status/faults",
+            "status/connection",
+            "status/software",
+            "status/summary",
+        ):
+            self._subscribe(f"{self._topic_root}/{suffix}")
         self._request_current_data()
         last_ping = time.monotonic()
         last_refresh = last_ping
@@ -1662,6 +1673,30 @@ def _inventory(*, refresh: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
     results: Dict[int, List[Dict[str, Any]]] = {}
     warnings: List[str] = []
 
+    def unavailable_devices(
+        device_settings: Dict[str, Any], warning: str
+    ) -> List[Dict[str, Any]]:
+        serial = _text(device_settings.get("DYSON_SERIAL_NUMBER"))
+        try:
+            host, port = _host_and_port(device_settings.get("DYSON_HOST"), serial)
+        except Exception:
+            host, port = _text(device_settings.get("DYSON_HOST")), DYSON_DEFAULT_PORT
+        return _build_devices(
+            device_settings,
+            {
+                "serial_number": serial,
+                "host": host,
+                "port": port,
+                "mqtt_prefix": _text(device_settings.get("DYSON_MQTT_PREFIX")),
+                "online": False,
+                "product_state": {},
+                "environment": {},
+                "faults": {},
+                "last_seen": 0.0,
+                "last_error": warning,
+            },
+        )
+
     def fetch(index: int, device_settings: Dict[str, Any]) -> Tuple[int, List[Dict[str, Any]], str]:
         label = _text(device_settings.get("DYSON_NAME")) or _text(
             device_settings.get("DYSON_SERIAL_NUMBER")
@@ -1669,7 +1704,8 @@ def _inventory(*, refresh: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
         try:
             mqtt_client = _client_for(device_settings)
         except Exception as exc:
-            return index, [], f"{label}: {_text(exc) or exc.__class__.__name__}"
+            warning = f"{label}: {_text(exc) or exc.__class__.__name__}"
+            return index, unavailable_devices(device_settings, warning), warning
         warning = ""
         try:
             snapshot = mqtt_client.request_snapshot(
@@ -1685,12 +1721,21 @@ def _inventory(*, refresh: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
         return index, _build_devices(device_settings, snapshot), warning
 
     with ThreadPoolExecutor(max_workers=min(8, len(configured_devices))) as executor:
-        futures = [
-            executor.submit(fetch, index, device_settings)
+        futures = {
+            executor.submit(fetch, index, device_settings): (index, device_settings)
             for index, device_settings in enumerate(configured_devices)
-        ]
+        }
         for future in as_completed(futures):
-            index, device_rows, warning = future.result()
+            fallback_index, fallback_settings = futures[future]
+            try:
+                index, device_rows, warning = future.result()
+            except Exception as exc:
+                index = fallback_index
+                label = _text(fallback_settings.get("DYSON_NAME")) or _text(
+                    fallback_settings.get("DYSON_SERIAL_NUMBER")
+                )
+                warning = f"{label}: {_text(exc) or exc.__class__.__name__}"
+                device_rows = unavailable_devices(fallback_settings, warning)
             results[index] = device_rows
             if warning:
                 warnings.append(warning)

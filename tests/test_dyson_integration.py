@@ -311,16 +311,23 @@ class DysonMqttProtocolTests(unittest.TestCase):
                 self.assertEqual(first_byte >> 4, 1)
                 connection.sendall(dyson._mqtt_packet(0x20, b"\x00\x00"))
 
-                first_byte, body = dyson._recv_mqtt_packet(connection)
-                self.assertEqual(first_byte, 0x82)
-                packet_id = body[:2]
-                connection.sendall(dyson._mqtt_packet(0x90, packet_id + b"\x00"))
+                subscribed_topics = []
 
                 sent_state = False
                 while True:
                     first_byte, body = dyson._recv_mqtt_packet(connection)
                     if first_byte >> 4 == 14:
                         return
+                    if first_byte == 0x82:
+                        packet_id = body[:2]
+                        topic_length = int.from_bytes(body[2:4], "big")
+                        subscribed_topics.append(
+                            body[4 : 4 + topic_length].decode("utf-8")
+                        )
+                        connection.sendall(
+                            dyson._mqtt_packet(0x90, packet_id + b"\x00")
+                        )
+                        continue
                     if first_byte >> 4 != 3:
                         continue
                     topic_length = int.from_bytes(body[:2], "big")
@@ -340,6 +347,12 @@ class DysonMqttProtocolTests(unittest.TestCase):
                         )
                     )
                     sent_state = True
+                    self.assertIn(
+                        "475/VS6-US-TEST1234/status/current", subscribed_topics
+                    )
+                    self.assertNotIn(
+                        "475/VS6-US-TEST1234/#", subscribed_topics
+                    )
             except Exception as exc:  # pragma: no cover - surfaced by the assertion below
                 broker_errors.append(exc)
             finally:
@@ -453,6 +466,22 @@ class DysonDeviceMappingTests(unittest.TestCase):
             {"Office Dyson", "Bedroom Dyson"},
         )
         self.assertEqual(result.get("warnings"), None)
+
+    def test_inventory_keeps_configured_fan_when_client_creation_fails(self) -> None:
+        with (
+            patch.object(
+                dyson, "read_dyson_settings", return_value=configured_settings()
+            ),
+            patch.object(
+                dyson, "_client_for", side_effect=RuntimeError("client failed")
+            ),
+        ):
+            result = dyson.integration_devices()
+
+        self.assertEqual(len(result["devices"]), 1)
+        self.assertEqual(result["devices"][0]["type"], "fan")
+        self.assertEqual(result["devices"][0]["state"], "unavailable")
+        self.assertIn("client failed", result["warnings"][0])
 
     def test_action_routes_to_the_selected_additional_device(self) -> None:
         settings = configured_settings(
