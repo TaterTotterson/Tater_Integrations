@@ -52,14 +52,29 @@ class FakeCastInfo:
         self.cast_type = "cast"
 
 
+class FakeZeroconf:
+    instances: list["FakeZeroconf"] = []
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.instances.append(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeBrowser:
-    def __init__(self, listener, *, known_hosts=None) -> None:
+    last_instance = None
+
+    def __init__(self, listener, zeroconf_instance=None, *, known_hosts=None) -> None:
         self.listener = listener
+        self.zeroconf_instance = zeroconf_instance
         self.known_hosts = known_hosts
         info = FakeCastInfo("12345678-1234-5678-1234-567812345678")
         self.devices = {info.uuid: info}
         self.started = False
         self.stopped = False
+        FakeBrowser.last_instance = self
 
     def start_discovery(self) -> None:
         self.started = True
@@ -114,6 +129,7 @@ class GoogleCastIntegrationTests(unittest.TestCase):
         dependencies = {
             "CastBrowser": FakeBrowser,
             "SimpleCastListener": lambda: object(),
+            "Zeroconf": FakeZeroconf,
         }
         self.redis.hashes[google_cast.GOOGLE_CAST_SETTINGS_KEY] = {
             "GOOGLE_CAST_DISCOVERY_TIMEOUT_SECONDS": "1",
@@ -127,6 +143,8 @@ class GoogleCastIntegrationTests(unittest.TestCase):
             result = google_cast.integration_devices()
 
         self.assertEqual(rows[0]["name"], "Office TV")
+        self.assertIsNotNone(FakeBrowser.last_instance.zeroconf_instance)
+        self.assertTrue(FakeBrowser.last_instance.zeroconf_instance.closed)
         self.assertEqual(result["devices"][0]["type"], "media_player")
         self.assertIn("play_media", result["devices"][0]["actions"])
         self.assertIn("media_player", result["devices"][0]["capabilities"])

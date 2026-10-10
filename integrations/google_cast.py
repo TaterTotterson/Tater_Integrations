@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import contextlib
 import importlib
@@ -122,6 +122,7 @@ def _load_cast_dependencies(*, required: bool = True) -> Optional[Dict[str, Any]
     try:
         pychromecast = importlib.import_module("pychromecast")
         discovery = importlib.import_module("pychromecast.discovery")
+        zeroconf = importlib.import_module("zeroconf")
     except Exception as exc:
         if required:
             raise RuntimeError(
@@ -132,6 +133,7 @@ def _load_cast_dependencies(*, required: bool = True) -> Optional[Dict[str, Any]
         "pychromecast": pychromecast,
         "CastBrowser": discovery.CastBrowser,
         "SimpleCastListener": pychromecast.SimpleCastListener,
+        "Zeroconf": zeroconf.Zeroconf,
         "get_chromecast_from_host": pychromecast.get_chromecast_from_host,
         "stream_type_buffered": pychromecast.STREAM_TYPE_BUFFERED,
     }
@@ -353,6 +355,7 @@ def discover_google_cast_devices(
                 return [dict(row) for row in cached]
 
         browser = None
+        zeroconf_instance = None
         rows: List[Dict[str, Any]] = []
         timeout_s = _bounded_int(
             settings.get("GOOGLE_CAST_DISCOVERY_TIMEOUT_SECONDS"),
@@ -363,8 +366,10 @@ def discover_google_cast_devices(
         known_hosts = _split_known_hosts(settings.get("GOOGLE_CAST_KNOWN_HOSTS"))
         try:
             listener = dependencies["SimpleCastListener"]()
+            zeroconf_instance = dependencies["Zeroconf"]()
             browser = dependencies["CastBrowser"](
                 listener,
+                zeroconf_instance,
                 known_hosts=known_hosts or None,
             )
             browser.start_discovery()
@@ -376,6 +381,9 @@ def discover_google_cast_devices(
             if browser is not None:
                 with contextlib.suppress(Exception):
                     browser.stop_discovery()
+            if zeroconf_instance is not None:
+                with contextlib.suppress(Exception):
+                    zeroconf_instance.close()
 
         if rows:
             _discovery_rows = rows
