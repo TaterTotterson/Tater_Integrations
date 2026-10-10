@@ -26,6 +26,17 @@
       "redis_strings": ["tater:web_search:brave_api_key"]
     },
     {
+      "id": "dyson",
+      "name": "Dyson",
+      "description": "Direct local Dyson fan and purifier sensor readings and controls over MQTT.",
+      "version": "1.0.0",
+      "entry": "integrations/dyson.py",
+      "sha256": "340567f2f421cc6126b522529b886072dd70e332655c6af0bc15960d37d5e839",
+      "required": false,
+      "capabilities": ["fan", "switch", "sensor", "air_quality", "temperature", "humidity"],
+      "redis_hashes": ["dyson_settings"]
+    },
+    {
       "id": "google_search",
       "name": "Google Custom Search",
       "description": "Adds Google Custom Search as a downloadable web search provider for Tater.",
