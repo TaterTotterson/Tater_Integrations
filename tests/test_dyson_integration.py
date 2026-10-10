@@ -157,6 +157,15 @@ class DysonSettingsTests(unittest.TestCase):
 
         self.assertEqual(definition["id"], "dyson")
         self.assertGreater(len(definition["fields"]), 0)
+        self.assertFalse(definition["settings_save"])
+        self.assertEqual(
+            [step["id"] for step in definition["settings_steps"]],
+            ["account", "verify", "devices"],
+        )
+        field_by_key = {field["key"]: field for field in definition["fields"]}
+        self.assertTrue(field_by_key["dyson_imported_devices"]["readonly"])
+        self.assertNotIn("dyson_credential", field_by_key)
+        self.assertNotIn("dyson_additional_credentials", field_by_key)
 
     def test_settings_never_save_cloud_password_or_otp(self) -> None:
         store = FakeRedis()
@@ -177,6 +186,8 @@ class DysonSettingsTests(unittest.TestCase):
         self.assertNotIn("123456", stored)
         self.assertEqual(values["dyson_cloud_password"], "")
         self.assertEqual(values["dyson_cloud_otp"], "")
+        self.assertNotIn("dyson_credential", values)
+        self.assertNotIn("dyson_additional_credentials", values)
 
     def test_cloud_otp_import_populates_all_compatible_fans(self) -> None:
         store = FakeRedis()
@@ -253,6 +264,10 @@ class DysonSettingsTests(unittest.TestCase):
         )
         self.assertEqual(len(imported["imported"]), 2)
         self.assertEqual(len(imported["warnings"]), 1)
+        self.assertIn("Living Room Dyson", imported["values"]["dyson_imported_devices"])
+        self.assertIn("Bedroom Dyson", imported["values"]["dyson_imported_devices"])
+        self.assertNotIn("local-primary", imported["values"]["dyson_imported_devices"])
+        self.assertNotIn("local-secondary", imported["values"]["dyson_imported_devices"])
         self.assertNotIn("account-secret", stored)
         self.assertNotIn("123456", stored)
         self.assertEqual(imported["values"]["dyson_cloud_password"], "")

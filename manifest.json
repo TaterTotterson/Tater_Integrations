@@ -29,9 +29,9 @@
       "id": "dyson",
       "name": "Dyson",
       "description": "Local Dyson fan and purifier control with optional account-assisted setup.",
-      "version": "1.1.1",
+      "version": "1.2.0",
       "entry": "integrations/dyson.py",
-      "sha256": "a6c46ad2faddb77035cffd259d35467b8454cd3d3d2683255cfc008912b795c2",
+      "sha256": "956ce6941745a030fd41e2e24721ba4c8928f016b7f760f9dad8d0d82cdef557",
       "required": false,
       "capabilities": ["fan", "switch", "sensor", "air_quality", "temperature", "humidity"],
       "redis_hashes": ["dyson_settings"]

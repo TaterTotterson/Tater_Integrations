@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 import atexit
 import base64
@@ -46,31 +46,59 @@ INTEGRATION = {
         "temperature",
         "humidity",
     ],
-    "fields": [
+    "settings_save": False,
+    "settings_steps": [
         {
-            "key": "dyson_enabled",
-            "label": "Enable Dyson",
-            "type": "checkbox",
-            "default": True,
+            "id": "account",
+            "eyebrow": "Step 1",
+            "title": "Sign in to Dyson",
+            "description": "Enter the same account details used by the MyDyson app. Your password is used only during setup and is never saved.",
+            "fields": [
+                "dyson_cloud_email",
+                "dyson_cloud_password",
+                "dyson_cloud_country",
+                "dyson_cloud_culture",
+            ],
+            "actions": ["cloud_request_otp"],
         },
         {
+            "id": "verify",
+            "eyebrow": "Step 2",
+            "title": "Verify your email",
+            "description": "Enter the one-time code Dyson emails you, then import every compatible fan and purifier on the account.",
+            "fields": ["dyson_cloud_otp"],
+            "actions": ["cloud_import"],
+        },
+        {
+            "id": "devices",
+            "eyebrow": "Step 3",
+            "title": "Imported fans",
+            "description": "These local connection details are managed automatically. Re-run the import whenever devices change in your Dyson account.",
+            "fields": ["dyson_imported_devices"],
+            "actions": ["test", "refresh"],
+        },
+    ],
+    "fields": [
+        {
             "key": "dyson_cloud_email",
-            "label": "Dyson Account Email (Setup Only)",
-            "type": "text",
+            "label": "Dyson account email",
+            "type": "email",
             "default": "",
             "placeholder": "you@example.com",
-            "description": "Optional. Used with the setup actions below to import every compatible fan from your Dyson account.",
+            "autocomplete": "username",
+            "description": "The email address used to sign in to the MyDyson app.",
         },
         {
             "key": "dyson_cloud_password",
-            "label": "Dyson Account Password (Never Saved)",
+            "label": "Dyson account password",
             "type": "password",
             "default": "",
-            "description": "Used only to finish Dyson login after the email OTP arrives. Tater never stores this value.",
+            "autocomplete": "current-password",
+            "description": "Used once to complete login. Tater never saves this password.",
         },
         {
             "key": "dyson_cloud_country",
-            "label": "Dyson Account Country Code",
+            "label": "Account country",
             "type": "text",
             "default": "US",
             "placeholder": "US",
@@ -78,7 +106,7 @@ INTEGRATION = {
         },
         {
             "key": "dyson_cloud_culture",
-            "label": "Dyson Account Locale",
+            "label": "Account language",
             "type": "text",
             "default": "en-US",
             "placeholder": "en-US",
@@ -86,95 +114,43 @@ INTEGRATION = {
         },
         {
             "key": "dyson_cloud_otp",
-            "label": "Email One-Time Password (Never Saved)",
-            "type": "password",
+            "label": "Email verification code",
+            "type": "text",
             "default": "",
             "placeholder": "123456",
-            "description": "First select Send Dyson OTP, then enter the code from Dyson and select Import Fans.",
+            "autocomplete": "one-time-code",
+            "description": "This code is used once and is never saved.",
+            "full_width": True,
         },
         {
-            "key": "dyson_serial_number",
-            "label": "Primary Device Serial Number",
-            "type": "text",
-            "default": "",
-            "placeholder": "VS6-US-ABC1234A",
-            "description": "The serial number printed on the fan or purifier sticker.",
-        },
-        {
-            "key": "dyson_host",
-            "label": "Primary Device IP Address or Hostname",
-            "type": "text",
-            "default": "",
-            "placeholder": "192.168.1.42",
-            "description": "A reserved IP address is recommended. When blank, Tater tries <serial>.local.",
-        },
-        {
-            "key": "dyson_credential",
-            "label": "Primary Device Password",
-            "type": "password",
-            "default": "",
-            "description": "The local device password from the product sticker; this is not your Dyson account password.",
-        },
-        {
-            "key": "dyson_mqtt_prefix",
-            "label": "Primary MQTT Prefix / Product Type",
-            "type": "text",
-            "default": "",
-            "placeholder": "438M",
-            "description": "The product type or MQTT prefix from the sticker or a Dyson discovery tool (for example 438M or 475).",
-        },
-        {
-            "key": "dyson_name",
-            "label": "Primary Device Name",
-            "type": "text",
-            "default": "",
-            "placeholder": "Living Room Dyson",
-        },
-        {
-            "key": "dyson_room",
-            "label": "Primary Device Room",
-            "type": "text",
-            "default": "",
-            "placeholder": "Living Room",
-        },
-        {
-            "key": "dyson_additional_devices",
-            "label": "Additional Dyson Devices",
+            "key": "dyson_imported_devices",
+            "label": "Fans and purifiers available to Tater",
             "type": "textarea",
-            "default": "",
+            "default": "No fans imported yet.",
             "rows": 5,
-            "placeholder": "HP07-US-ABC1234A | 192.168.1.43 | 527 | Bedroom Dyson | Bedroom",
-            "description": "Optional. One device per line: serial | host | MQTT prefix | name | room. Name and room are optional; host may be blank to use <serial>.local.",
+            "readonly": True,
+            "description": "Device passwords stay encrypted in Tater and are never displayed here.",
             "full_width": True,
-        },
-        {
-            "key": "dyson_additional_credentials",
-            "label": "Additional Device Passwords",
-            "type": "password",
-            "default": "",
-            "placeholder": "HP07-US-ABC1234A=device-password; TP09-US-XYZ9876=device-password",
-            "description": "A semicolon-separated serial=password entry for each additional device.",
-            "full_width": True,
-        },
-        {
-            "key": "dyson_timeout_seconds",
-            "label": "Connection Timeout Seconds",
-            "type": "number",
-            "default": 8,
-            "min": 2,
-            "max": 30,
         },
     ],
     "actions": [
         {
             "id": "cloud_request_otp",
-            "label": "Send Dyson OTP",
+            "label": "Get OTP Code",
             "status": "Requests a one-time login code from Dyson for account-assisted setup.",
+            "requires": ["dyson_cloud_email", "dyson_cloud_password"],
+            "primary": True,
         },
         {
             "id": "cloud_import",
             "label": "Import Fans from Dyson Account",
             "status": "Uses the OTP once to discover fans and save only their local connection credentials.",
+            "requires": [
+                "dyson_cloud_email",
+                "dyson_cloud_password",
+                "dyson_cloud_otp",
+            ],
+            "primary": True,
         },
         {
             "id": "test",
@@ -852,25 +828,7 @@ def _import_cloud_devices(payload: Dict[str, Any], client: Any = None) -> Dict[s
         _clear_cloud_challenge(store)
         with _cloud_sessions_lock:
             _cloud_sessions.pop(email.casefold(), None)
-    values = {
-        "dyson_enabled": _as_bool(saved.get("DYSON_ENABLED"), True),
-        "dyson_cloud_email": saved.get("DYSON_CLOUD_EMAIL", ""),
-        "dyson_cloud_password": "",
-        "dyson_cloud_country": saved.get("DYSON_CLOUD_COUNTRY", "US"),
-        "dyson_cloud_culture": saved.get("DYSON_CLOUD_CULTURE", "en-US"),
-        "dyson_cloud_otp": "",
-        "dyson_serial_number": saved.get("DYSON_SERIAL_NUMBER", ""),
-        "dyson_host": saved.get("DYSON_HOST", ""),
-        "dyson_credential": saved.get("DYSON_CREDENTIAL", ""),
-        "dyson_mqtt_prefix": saved.get("DYSON_MQTT_PREFIX", ""),
-        "dyson_name": saved.get("DYSON_NAME", ""),
-        "dyson_room": saved.get("DYSON_ROOM", ""),
-        "dyson_additional_devices": saved.get("DYSON_ADDITIONAL_DEVICES", ""),
-        "dyson_additional_credentials": saved.get("DYSON_ADDITIONAL_CREDENTIALS", ""),
-        "dyson_timeout_seconds": int(
-            saved.get("DYSON_TIMEOUT_SECONDS") or DYSON_DEFAULT_TIMEOUT_SECONDS
-        ),
-    }
+    values = _integration_setup_values(saved)
     warning_text = f" {len(warnings)} unsupported device(s) were skipped." if warnings else ""
     return {
         "ok": True,
@@ -1387,6 +1345,32 @@ def _device_settings(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
     return devices
 
 
+def _imported_devices_summary(settings: Dict[str, Any]) -> str:
+    try:
+        devices = _device_settings(settings)
+    except (TypeError, ValueError):
+        return "No fans imported yet."
+    lines: List[str] = []
+    for device in devices:
+        serial = _text(device.get("DYSON_SERIAL_NUMBER"))
+        name = _text(device.get("DYSON_NAME")) or f"Dyson {serial}"
+        mqtt_prefix = _text(device.get("DYSON_MQTT_PREFIX"))
+        host = _text(device.get("DYSON_HOST")) or f"{serial}.local (automatic)"
+        lines.append(f"{name} — {serial} — MQTT {mqtt_prefix} — {host}")
+    return "\n".join(lines) or "No fans imported yet."
+
+
+def _integration_setup_values(settings: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "dyson_cloud_email": settings.get("DYSON_CLOUD_EMAIL", ""),
+        "dyson_cloud_password": "",
+        "dyson_cloud_country": settings.get("DYSON_CLOUD_COUNTRY", "US"),
+        "dyson_cloud_culture": settings.get("DYSON_CLOUD_CULTURE", "en-US"),
+        "dyson_cloud_otp": "",
+        "dyson_imported_devices": _imported_devices_summary(settings),
+    }
+
+
 def _configuration_error(settings: Dict[str, Any]) -> str:
     if not _as_bool(settings.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED):
         return "Dyson is disabled."
@@ -1587,24 +1571,7 @@ def _build_devices(settings: Dict[str, Any], snapshot: Dict[str, Any]) -> List[D
 
 
 def read_integration_settings() -> Dict[str, Any]:
-    settings = read_dyson_settings()
-    return {
-        "dyson_enabled": _as_bool(settings.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED),
-        "dyson_cloud_email": settings.get("DYSON_CLOUD_EMAIL", ""),
-        "dyson_cloud_password": "",
-        "dyson_cloud_country": settings.get("DYSON_CLOUD_COUNTRY", "US"),
-        "dyson_cloud_culture": settings.get("DYSON_CLOUD_CULTURE", "en-US"),
-        "dyson_cloud_otp": "",
-        "dyson_serial_number": settings.get("DYSON_SERIAL_NUMBER", ""),
-        "dyson_host": settings.get("DYSON_HOST", ""),
-        "dyson_credential": settings.get("DYSON_CREDENTIAL", ""),
-        "dyson_mqtt_prefix": settings.get("DYSON_MQTT_PREFIX", ""),
-        "dyson_name": settings.get("DYSON_NAME", ""),
-        "dyson_room": settings.get("DYSON_ROOM", ""),
-        "dyson_additional_devices": settings.get("DYSON_ADDITIONAL_DEVICES", ""),
-        "dyson_additional_credentials": settings.get("DYSON_ADDITIONAL_CREDENTIALS", ""),
-        "dyson_timeout_seconds": int(settings.get("DYSON_TIMEOUT_SECONDS") or DYSON_DEFAULT_TIMEOUT_SECONDS),
-    }
+    return _integration_setup_values(read_dyson_settings())
 
 
 def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1624,23 +1591,7 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         additional_credentials=data.get("dyson_additional_credentials"),
         timeout_seconds=data.get("dyson_timeout_seconds"),
     )
-    return {
-        "dyson_enabled": _as_bool(saved.get("DYSON_ENABLED"), DYSON_DEFAULT_ENABLED),
-        "dyson_cloud_email": saved.get("DYSON_CLOUD_EMAIL", ""),
-        "dyson_cloud_password": "",
-        "dyson_cloud_country": saved.get("DYSON_CLOUD_COUNTRY", "US"),
-        "dyson_cloud_culture": saved.get("DYSON_CLOUD_CULTURE", "en-US"),
-        "dyson_cloud_otp": "",
-        "dyson_serial_number": saved.get("DYSON_SERIAL_NUMBER", ""),
-        "dyson_host": saved.get("DYSON_HOST", ""),
-        "dyson_credential": saved.get("DYSON_CREDENTIAL", ""),
-        "dyson_mqtt_prefix": saved.get("DYSON_MQTT_PREFIX", ""),
-        "dyson_name": saved.get("DYSON_NAME", ""),
-        "dyson_room": saved.get("DYSON_ROOM", ""),
-        "dyson_additional_devices": saved.get("DYSON_ADDITIONAL_DEVICES", ""),
-        "dyson_additional_credentials": saved.get("DYSON_ADDITIONAL_CREDENTIALS", ""),
-        "dyson_timeout_seconds": int(saved.get("DYSON_TIMEOUT_SECONDS") or DYSON_DEFAULT_TIMEOUT_SECONDS),
-    }
+    return _integration_setup_values(saved)
 
 
 def integration_status() -> Dict[str, Any]:
