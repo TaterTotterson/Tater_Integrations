@@ -37,6 +37,18 @@
       "redis_hashes": ["dyson_settings"]
     },
     {
+      "id": "google_cast",
+      "name": "Google Cast",
+      "description": "Discovers Google Cast TVs, speakers, and groups as direct Tater media playback targets.",
+      "version": "1.0.0",
+      "entry": "integrations/google_cast.py",
+      "sha256": "0833d8293de081c91cf4b88dd16d051191f9be3683ebdf28a7a2db7eb9e9939c",
+      "required": false,
+      "capabilities": ["speaker", "media_player", "audio_output", "announcement_target"],
+      "redis_hashes": ["google_cast_settings"],
+      "redis_strings": ["tater:google_cast:players:registry:v1"]
+    },
+    {
       "id": "google_search",
       "name": "Google Custom Search",
       "description": "Adds Google Custom Search as a downloadable web search provider for Tater.",

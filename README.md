@@ -361,6 +361,12 @@ Use the first available URL field. Return `{"ok": True, "sent_count": 1}` when p
 
 Do not mark provider-specific library playback as generic URL playback. Roon is a good example: playing "the Eagles" is a music-library operation, not "play this URL". That should stay behind a provider-specific Verba or action unless the provider can also play arbitrary URLs.
 
+### Google Cast playback
+
+The Google Cast integration discovers `_googlecast._tcp.local.` devices through PyChromecast and exposes TVs, speakers, and speaker groups through the generic media playback contract. Tater's runtime requirements provide the pinned PyChromecast dependency; the integration reports a clear setup error when that dependency is unavailable.
+
+Cast receivers fetch the media URL themselves. Generated audio must therefore use an HTTP or HTTPS URL reachable from the receiver's network. A loopback URL such as `http://127.0.0.1/...`, a container-only hostname, or a `file://` path will not work from a Cast device. Use the Tater server's LAN-reachable runtime media URL.
+
 ## Web search contract
 
 Search providers should declare `capabilities: ["web_search"]` and implement `integration_web_search()`.
