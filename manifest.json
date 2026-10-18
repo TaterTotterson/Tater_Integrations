@@ -37,6 +37,17 @@
       "redis_hashes": ["dyson_settings"]
     },
     {
+      "id": "duckduckgo_search",
+      "name": "DuckDuckGo Search",
+      "description": "Adds keyless DuckDuckGo web search as a downloadable provider for Tater.",
+      "version": "1.0.0",
+      "entry": "integrations/duckduckgo_search.py",
+      "sha256": "5c37a10d34784eb161f5abd05d48222127505ac610263a697ff19b6bc5171cfe",
+      "required": false,
+      "capabilities": ["web_search"],
+      "redis_hashes": ["duckduckgo_search_settings"]
+    },
+    {
       "id": "google_cast",
       "name": "Google Cast",
       "description": "Discovers Google Cast TVs, speakers, and groups as direct Tater media playback targets.",

@@ -407,6 +407,8 @@ def integration_web_search(
 
 If the provider is not configured, return `{"tool": "search_web", "ok": False, "provider": "...", "error": "...", "needs": [...]}`. Keep the provider module self-contained: store credentials in an integration-specific Redis hash, expose settings fields through `INTEGRATION["fields"]`, and include a `test` action that runs a small search.
 
+The DuckDuckGo Search integration is keyless. It prefers the current `ddgs` package and remains compatible with Tater runtimes that still provide the legacy `duckduckgo_search` package. Because it relies on DuckDuckGo's public search pages rather than a contracted API, keep it behind API-backed providers in automatic fallback order and expect upstream rate limits or markup changes to occasionally affect availability.
+
 Camera integrations that support snapshots should also define:
 
 ```python
