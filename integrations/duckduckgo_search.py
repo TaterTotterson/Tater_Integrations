@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
 from helpers import redis_client
@@ -14,7 +16,10 @@ from helpers import redis_client
 DUCKDUCKGO_SEARCH_SETTINGS_KEY = "duckduckgo_search_settings"
 DUCKDUCKGO_SEARCH_DEFAULT_REGION = "wt-wt"
 DUCKDUCKGO_SEARCH_DEFAULT_TIMEOUT_SECONDS = 15
+DUCKDUCKGO_SEARCH_HTML_URL = "https://html.duckduckgo.com/html/"
+DUCKDUCKGO_SEARCH_MAX_RESPONSE_BYTES = int(os.getenv("TATER_WEB_SEARCH_MAX_RESPONSE_BYTES", "2000000"))
 DUCKDUCKGO_SEARCH_MAX_SNIPPET_CHARS = int(os.getenv("TATER_WEB_SEARCH_MAX_SNIPPET_CHARS", "600"))
+DUCKDUCKGO_SEARCH_MAX_PAGES = 10
 
 INTEGRATION = {
     "id": "duckduckgo_search",
@@ -98,33 +103,10 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"duckduckgo_region": saved.get("DUCKDUCKGO_REGION", DUCKDUCKGO_SEARCH_DEFAULT_REGION)}
 
 
-def _load_ddgs_client() -> Tuple[Any, str]:
-    try:
-        from ddgs import DDGS
-
-        return DDGS, "ddgs"
-    except Exception:
-        try:
-            from duckduckgo_search import DDGS
-
-            return DDGS, "duckduckgo_search"
-        except Exception as legacy_exc:
-            raise RuntimeError(
-                "DuckDuckGo search dependency is unavailable; install the ddgs Python package."
-            ) from legacy_exc
-
-
 def integration_status() -> Dict[str, Any]:
-    try:
-        _client, package_name = _load_ddgs_client()
-    except Exception:
-        return {
-            "configured": False,
-            "message": "DuckDuckGo Search needs the ddgs Python package installed in Tater.",
-        }
     return {
         "configured": True,
-        "message": f"DuckDuckGo Search is ready ({package_name}).",
+        "message": "DuckDuckGo Search is ready. No API key or additional package is required.",
     }
 
 
@@ -224,9 +206,97 @@ def _error(message: str, *, needs: Optional[List[str]] = None) -> Dict[str, Any]
     return out
 
 
-def _proxy_url() -> Optional[str]:
-    proxies = urllib.request.getproxies()
-    return _text(proxies.get("https") or proxies.get("http")) or None
+def _collapse_whitespace(value: Any) -> str:
+    return " ".join(_text(value).split())
+
+
+class _DuckDuckGoHTMLParser(HTMLParser):
+    """Extract organic results and the next-page form from DuckDuckGo HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: List[Dict[str, str]] = []
+        self.next_params: Optional[Dict[str, str]] = None
+        self._active_result: Optional[Dict[str, str]] = None
+        self._capture: Optional[str] = None
+        self._form: Optional[Dict[str, str]] = None
+        self._form_is_next = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = {key: value or "" for key, value in attrs}
+        classes = set(attributes.get("class", "").split())
+
+        if tag == "a" and "result__a" in classes:
+            result = {"title": "", "href": attributes.get("href", ""), "body": ""}
+            self.results.append(result)
+            self._active_result = result
+            self._capture = "title"
+        elif tag == "a" and "result__snippet" in classes and self._active_result is not None:
+            self._capture = "body"
+        elif tag == "form":
+            self._form = {}
+            self._form_is_next = False
+        elif tag == "input" and self._form is not None:
+            name = attributes.get("name", "")
+            if name:
+                self._form[name] = attributes.get("value", "")
+            if attributes.get("type", "").lower() == "submit" and attributes.get("value", "").lower() == "next":
+                self._form_is_next = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._capture = None
+        elif tag == "form" and self._form is not None:
+            if self._form_is_next:
+                self.next_params = dict(self._form)
+            self._form = None
+            self._form_is_next = False
+
+    def handle_data(self, data: str) -> None:
+        if self._active_result is not None and self._capture:
+            self._active_result[self._capture] += data
+
+
+def _normalize_result_url(value: Any) -> str:
+    href = _text(value)
+    if not href:
+        return ""
+    absolute = urllib.parse.urljoin("https://duckduckgo.com/", href)
+    parsed = urllib.parse.urlparse(absolute)
+    hostname = (parsed.hostname or "").lower()
+    is_duckduckgo = hostname == "duckduckgo.com" or hostname.endswith(".duckduckgo.com")
+    if is_duckduckgo and parsed.path.rstrip("/") == "/l":
+        redirect_target = (urllib.parse.parse_qs(parsed.query).get("uddg") or [""])[0]
+        absolute = _text(redirect_target)
+        parsed = urllib.parse.urlparse(absolute)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return absolute
+
+
+def _fetch_search_page(payload: Dict[str, str], *, timeout_sec: int) -> str:
+    request = urllib.request.Request(
+        DUCKDUCKGO_SEARCH_HTML_URL,
+        data=urllib.parse.urlencode(payload).encode("utf-8"),
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://html.duckduckgo.com/",
+            "User-Agent": "Mozilla/5.0 (compatible; Tater/1.0)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            raw = response.read(DUCKDUCKGO_SEARCH_MAX_RESPONSE_BYTES + 1)
+            charset = response.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"DuckDuckGo returned HTTP {exc.code}.") from exc
+    except Exception as exc:
+        raise RuntimeError(f"DuckDuckGo request failed: {_text(exc) or exc.__class__.__name__}") from exc
+    if len(raw) > DUCKDUCKGO_SEARCH_MAX_RESPONSE_BYTES:
+        raise RuntimeError("DuckDuckGo returned an unexpectedly large response.")
+    return raw.decode(charset, errors="replace")
 
 
 def _raw_search(
@@ -237,17 +307,42 @@ def _raw_search(
     max_results: int,
     timeout_sec: int,
 ) -> List[Dict[str, Any]]:
-    client_class, package_name = _load_ddgs_client()
-    backend = "duckduckgo" if package_name == "ddgs" else "auto"
-    with client_class(proxy=_proxy_url(), timeout=timeout_sec) as client:
-        rows = client.text(
-            query,
-            region=region,
-            safesearch=safesearch,
-            max_results=max_results,
-            backend=backend,
-        )
-    return [row for row in (rows or []) if isinstance(row, dict)]
+    safe_param = "-2" if safesearch == "off" else "-1"
+    payload = {"q": query, "kl": region, "kp": safe_param}
+    results: List[Dict[str, Any]] = []
+    seen_urls = set()
+
+    for _page_number in range(DUCKDUCKGO_SEARCH_MAX_PAGES):
+        document = _fetch_search_page(payload, timeout_sec=timeout_sec)
+        lowered = document.lower()
+        if "unfortunately, bots use duckduckgo too" in lowered or "anomaly-modal" in lowered:
+            raise RuntimeError("DuckDuckGo temporarily blocked the search request; try again later.")
+
+        parser = _DuckDuckGoHTMLParser()
+        parser.feed(document)
+        for row in parser.results:
+            url = _normalize_result_url(row.get("href"))
+            if not url or url in seen_urls or "ad_domain=" in _text(row.get("href")):
+                continue
+            seen_urls.add(url)
+            results.append(
+                {
+                    "title": _collapse_whitespace(row.get("title")) or url,
+                    "href": url,
+                    "body": _collapse_whitespace(row.get("body")),
+                }
+            )
+            if len(results) >= max_results:
+                return results
+
+        if not parser.next_params:
+            break
+        payload = dict(parser.next_params)
+        payload.setdefault("q", query)
+        payload.setdefault("kl", region)
+        payload.setdefault("kp", safe_param)
+
+    return results
 
 
 def integration_web_search(
@@ -264,13 +359,6 @@ def integration_web_search(
     q = _text(query)
     if not q:
         return _error("query is required.")
-    try:
-        _load_ddgs_client()
-    except Exception:
-        return _error(
-            "DuckDuckGo Search dependency is unavailable.",
-            needs=["Install the ddgs Python package in Tater's runtime, then restart Tater."],
-        )
 
     max_results = _bounded_int(num_results, default=5, minimum=1, maximum=10)
     start_index = _bounded_int(start, default=1, minimum=1, maximum=91)

@@ -29,35 +29,35 @@ class FakeRedis:
         self.hashes.setdefault(key, {}).update(mapping)
 
 
-class FakeDDGS:
-    calls: list[dict] = []
+def result_markup(index: int) -> str:
+    target = f"https://example{index}.com/page?item={index}"
+    redirect = "//duckduckgo.com/l/?uddg=" + target.replace(":", "%3A").replace("/", "%2F").replace("?", "%3F").replace("=", "%3D")
+    return f"""
+    <div class="result web-result">
+      <h2><a class="result__a" href="{redirect}">Result <b>{index}</b></a></h2>
+      <a class="result__snippet" href="{redirect}">Snippet <b>{index}</b></a>
+    </div>
+    """
 
-    def __init__(self, **kwargs) -> None:
-        self.init_kwargs = dict(kwargs)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args) -> None:
-        return None
-
-    def text(self, query: str, **kwargs):
-        self.calls.append({"query": query, "init": self.init_kwargs, **kwargs})
-        return [
-            {
-                "title": f"Result {index}",
-                "href": f"https://example{index}.com/page",
-                "body": f"Snippet {index}",
-            }
-            for index in range(1, 8)
-        ]
+def search_page(indices: list[int], *, next_offset: int | None = None) -> str:
+    next_form = ""
+    if next_offset is not None:
+        next_form = f"""
+        <div class="nav-link"><form action="/html/" method="post">
+          <input type="submit" value="Next" />
+          <input type="hidden" name="q" value="site:example.com coffee" />
+          <input type="hidden" name="s" value="{next_offset}" />
+          <input type="hidden" name="vqd" value="test-token" />
+        </form></div>
+        """
+    return "<html><body>" + "".join(result_markup(index) for index in indices) + next_form + "</body></html>"
 
 
 class DuckDuckGoSearchIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.redis = FakeRedis()
         duckduckgo_search.redis_client = self.redis
-        FakeDDGS.calls = []
 
     def test_settings_round_trip_and_region_validation(self) -> None:
         saved = duckduckgo_search.save_duckduckgo_search_settings(region="US_EN")
@@ -70,10 +70,13 @@ class DuckDuckGoSearchIntegrationTests(unittest.TestCase):
         self.redis.hashes[duckduckgo_search.DUCKDUCKGO_SEARCH_SETTINGS_KEY] = {
             "DUCKDUCKGO_REGION": "wt-wt",
         }
-        with (
-            patch.object(duckduckgo_search, "_load_ddgs_client", return_value=(FakeDDGS, "ddgs")),
-            patch.object(duckduckgo_search, "_proxy_url", return_value=None),
-        ):
+        calls: list[dict] = []
+
+        def fake_fetch(payload: dict[str, str], *, timeout_sec: int) -> str:
+            calls.append({"payload": dict(payload), "timeout_sec": timeout_sec})
+            return search_page([1, 2], next_offset=2) if len(calls) == 1 else search_page([3, 4, 5])
+
+        with patch.object(duckduckgo_search, "_fetch_search_page", side_effect=fake_fetch):
             result = duckduckgo_search.integration_web_search(
                 "coffee",
                 num_results=2,
@@ -91,39 +94,33 @@ class DuckDuckGoSearchIntegrationTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["title"], "Result 3")
         self.assertEqual(result["next_start"], 5)
         self.assertEqual(result["site_filter"], "example.com")
-        call = FakeDDGS.calls[0]
-        self.assertEqual(call["query"], "site:example.com coffee")
-        self.assertEqual(call["region"], "uk-en")
-        self.assertEqual(call["safesearch"], "off")
-        self.assertEqual(call["backend"], "duckduckgo")
-        self.assertEqual(call["init"]["timeout"], 9)
+        self.assertEqual(result["results"][0]["url"], "https://example3.com/page?item=3")
+        self.assertEqual(calls[0]["payload"]["q"], "site:example.com coffee")
+        self.assertEqual(calls[0]["payload"]["kl"], "uk-en")
+        self.assertEqual(calls[0]["payload"]["kp"], "-2")
+        self.assertEqual(calls[0]["timeout_sec"], 9)
+        self.assertEqual(calls[1]["payload"]["s"], "2")
+        self.assertEqual(calls[1]["payload"]["kl"], "uk-en")
 
-    def test_legacy_client_uses_compatible_backend(self) -> None:
-        with (
-            patch.object(
-                duckduckgo_search,
-                "_load_ddgs_client",
-                return_value=(FakeDDGS, "duckduckgo_search"),
-            ),
-            patch.object(duckduckgo_search, "_proxy_url", return_value=None),
-        ):
-            result = duckduckgo_search.integration_web_search("tater", num_results=1)
+    def test_status_is_ready_without_an_external_dependency(self) -> None:
+        self.assertEqual(
+            duckduckgo_search.integration_status(),
+            {
+                "configured": True,
+                "message": "DuckDuckGo Search is ready. No API key or additional package is required.",
+            },
+        )
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(FakeDDGS.calls[0]["backend"], "auto")
-
-    def test_missing_dependency_is_reported_without_import_failure(self) -> None:
+    def test_upstream_failure_is_returned_as_search_error(self) -> None:
         with patch.object(
             duckduckgo_search,
-            "_load_ddgs_client",
-            side_effect=RuntimeError("missing"),
+            "_fetch_search_page",
+            side_effect=RuntimeError("DuckDuckGo returned HTTP 429."),
         ):
-            status = duckduckgo_search.integration_status()
             result = duckduckgo_search.integration_web_search("tater")
 
-        self.assertFalse(status["configured"])
         self.assertFalse(result["ok"])
-        self.assertIn("Install the ddgs Python package", result["needs"][0])
+        self.assertIn("HTTP 429", result["error"])
 
     def test_test_action_returns_normalized_success(self) -> None:
         with patch.object(

@@ -40,9 +40,9 @@
       "id": "duckduckgo_search",
       "name": "DuckDuckGo Search",
       "description": "Adds keyless DuckDuckGo web search as a downloadable provider for Tater.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "entry": "integrations/duckduckgo_search.py",
-      "sha256": "5c37a10d34784eb161f5abd05d48222127505ac610263a697ff19b6bc5171cfe",
+      "sha256": "05334e968bdf3af0f884433a8a4a6003fc378cfdc35837df86cd3d21f8623efa",
       "required": false,
       "capabilities": ["web_search"],
       "redis_hashes": ["duckduckgo_search_settings"]
