@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import json
 import os
@@ -111,6 +111,94 @@ def _display_url(url: str) -> str:
     return parsed.netloc or _text(url)
 
 
+def _location_address(item: Dict[str, Any]) -> str:
+    address = item.get("postal_address")
+    if not isinstance(address, dict):
+        return ""
+    display_address = _text(address.get("displayAddress") or address.get("display_address"))
+    if display_address:
+        return display_address
+    return ", ".join(
+        value
+        for value in (
+            _text(address.get("streetAddress") or address.get("street_address")),
+            _text(address.get("addressLocality") or address.get("address_locality")),
+            _text(address.get("addressRegion") or address.get("address_region")),
+            _text(address.get("postalCode") or address.get("postal_code")),
+            _text(address.get("country")),
+        )
+        if value
+    )
+
+
+def _location_hours(item: Dict[str, Any]) -> str:
+    opening_hours = item.get("opening_hours")
+    if not isinstance(opening_hours, dict):
+        return ""
+    current_day = opening_hours.get("current_day")
+    if not isinstance(current_day, list):
+        return ""
+    periods: List[str] = []
+    for period in current_day:
+        if not isinstance(period, dict):
+            continue
+        day = _text(period.get("full_name") or period.get("abbr_name"))
+        opens = _text(period.get("opens"))
+        closes = _text(period.get("closes"))
+        if opens and closes:
+            periods.append(f"{day + ' ' if day else ''}{opens}-{closes}")
+        elif opens:
+            periods.append(f"{day + ' ' if day else ''}opens {opens}")
+        elif day:
+            periods.append(day)
+    return ", ".join(periods)
+
+
+def _location_snippet(item: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    description = _text(item.get("description"))
+    address = _location_address(item)
+    hours = _location_hours(item)
+    contact = item.get("contact")
+    telephone = _text(contact.get("telephone")) if isinstance(contact, dict) else ""
+    rating = item.get("rating")
+    if isinstance(rating, dict):
+        rating_value = _text(rating.get("ratingValue") or rating.get("rating_value"))
+        best_rating = _text(rating.get("bestRating") or rating.get("best_rating"))
+        review_count = _text(rating.get("reviewCount") or rating.get("review_count"))
+    else:
+        rating_value = ""
+        best_rating = ""
+        review_count = ""
+
+    if description:
+        parts.append(description)
+    if address:
+        parts.append(f"Address: {address}")
+    if hours:
+        parts.append(f"Hours today: {hours}")
+    if telephone:
+        parts.append(f"Phone: {telephone}")
+    if rating_value:
+        rating_text = rating_value + (f"/{best_rating}" if best_rating else "")
+        if review_count:
+            rating_text += f" ({review_count} reviews)"
+        parts.append(f"Rating: {rating_text}")
+    return _truncate_snippet(". ".join(parts))
+
+
+def _normalize_result(item: Dict[str, Any], *, location: bool = False) -> Optional[Dict[str, Any]]:
+    url = _text(item.get("url") or (item.get("provider_url") if location else ""))
+    if not url:
+        return None
+    return {
+        "title": _text(item.get("title")) or url,
+        "url": url,
+        "snippet": _location_snippet(item) if location else _truncate_snippet(item.get("description")),
+        "display_url": _display_url(url),
+    }
+
+
 def _success(
     *,
     query: str,
@@ -118,14 +206,27 @@ def _success(
     max_results: int,
     results: List[Dict[str, Any]],
     site_val: str,
+    original_query: str,
+    corrected_query: str,
+    cleaned_query: str,
+    spellcheck_off: Optional[bool],
+    has_more: bool,
 ) -> Dict[str, Any]:
-    next_start = start_index + max_results if len(results) >= max_results else None
+    effective_query = corrected_query or cleaned_query or original_query or query
+    spellcheck_applied = bool(corrected_query and corrected_query.casefold() != original_query.casefold())
+    next_start = start_index + max_results if has_more and results else None
     return {
         "tool": "search_web",
         "ok": True,
         "provider": "brave_search",
         "provider_label": "Brave Search",
         "query": query,
+        "original_query": original_query or query,
+        "corrected_query": corrected_query or None,
+        "cleaned_query": cleaned_query or None,
+        "effective_query": effective_query,
+        "spellcheck_applied": spellcheck_applied,
+        "spellcheck_off": spellcheck_off,
         "start": start_index,
         "count": len(results),
         "num_results": max_results,
@@ -204,8 +305,9 @@ def integration_web_search(
     params: Dict[str, Any] = {
         "q": _query_with_site(q, site_val),
         "count": max_results,
-        "offset": max(0, start_index - 1),
+        "offset": min(9, max(0, (start_index - 1) // max_results)),
         "safesearch": "strict" if safe_mode == "active" else "off",
+        "spellcheck": "true",
     }
     if country_val and re.fullmatch(r"[a-z]{2}", country_val):
         params["country"] = country_val
@@ -223,24 +325,59 @@ def integration_web_search(
     payload, error = _read_json(req, timeout_val=timeout_val)
     if error:
         return error
+    if payload.get("error"):
+        error_payload = payload.get("error")
+        if isinstance(error_payload, dict):
+            error_message = _text(error_payload.get("detail") or error_payload.get("message") or error_payload.get("code"))
+        else:
+            error_message = _text(error_payload)
+        return _error(error_message or "Unknown Brave Search error.")
 
+    query_payload = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+    original_query = _text(query_payload.get("original")) or q
+    corrected_query = _text(query_payload.get("altered"))
+    cleaned_query = _text(query_payload.get("cleaned"))
+    spellcheck_off_value = query_payload.get("spellcheck_off")
+    spellcheck_off = spellcheck_off_value if isinstance(spellcheck_off_value, bool) else None
+    location_payload = payload.get("locations") if isinstance(payload.get("locations"), dict) else {}
     web_payload = payload.get("web") if isinstance(payload.get("web"), dict) else {}
     results: List[Dict[str, Any]] = []
-    for item in web_payload.get("results") or []:
-        if not isinstance(item, dict):
-            continue
-        url = _text(item.get("url"))
-        if not url:
-            continue
-        results.append(
-            {
-                "title": _text(item.get("title")) or url,
-                "url": url,
-                "snippet": _truncate_snippet(item.get("description")),
-                "display_url": _display_url(url),
-            }
-        )
-    return _success(query=q, start_index=start_index, max_results=max_results, results=results, site_val=site_val)
+    seen_urls = set()
+    location_rows = location_payload.get("results") if isinstance(location_payload.get("results"), list) else []
+    web_rows = web_payload.get("results") if isinstance(web_payload.get("results"), list) else []
+    for rows, is_location in ((location_rows, True), (web_rows, False)):
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalize_result(item, location=is_location)
+            if not normalized or normalized["url"] in seen_urls:
+                continue
+            seen_urls.add(normalized["url"])
+            results.append(normalized)
+            if len(results) >= max_results:
+                break
+        if len(results) >= max_results:
+            break
+
+    more_results_available = query_payload.get("more_results_available")
+    if isinstance(more_results_available, bool):
+        has_more = more_results_available
+    else:
+        has_more = len(location_rows) + len(web_rows) > len(results) or len(web_rows) >= max_results
+    if int(params["offset"]) >= 9:
+        has_more = False
+    return _success(
+        query=q,
+        start_index=start_index,
+        max_results=max_results,
+        results=results,
+        site_val=site_val,
+        original_query=original_query,
+        corrected_query=corrected_query,
+        cleaned_query=cleaned_query,
+        spellcheck_off=spellcheck_off,
+        has_more=has_more,
+    )
 
 
 def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
