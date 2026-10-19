@@ -170,6 +170,151 @@ class BraveSearchIntegrationTests(unittest.TestCase):
         self.assertIsNone(result["next_start"])
         self.assertFalse(result["spellcheck_applied"])
 
+    def test_local_hours_query_recovers_with_autosuggest(self) -> None:
+        self.configure()
+        calls: list[tuple[str, dict[str, list[str]]]] = []
+        initial_payload = {
+            "query": {
+                "original": "what time does Cole's closed in east bell",
+                "spellcheck_off": False,
+                "more_results_available": False,
+            },
+            "web": {
+                "results": [
+                    {
+                        "title": "Cole Elementary - Bell Schedule",
+                        "url": "https://school.example/bell-schedule",
+                        "description": "School schedule and announcements.",
+                    }
+                ]
+            },
+        }
+        suggest_payload = {
+            "type": "suggest",
+            "query": {"original": "Cole's east bell"},
+            "results": [
+                {"query": "kohl's eastvale"},
+                {"query": "cole elementary bell schedule"},
+            ],
+        }
+        recovery_payload = {
+            "query": {
+                "original": "kohl's eastvale hours",
+                "spellcheck_off": False,
+                "more_results_available": False,
+            },
+            "locations": {
+                "results": [
+                    {
+                        "title": "Kohl's Eastvale",
+                        "url": "https://www.kohls.com/stores/ca/eastvale.shtml",
+                        "postal_address": {"displayAddress": "Eastvale, CA"},
+                        "opening_hours": {
+                            "current_day": [
+                                {"full_name": "Sunday", "opens": "09:00", "closes": "21:00"}
+                            ]
+                        },
+                    }
+                ]
+            },
+            "web": {"results": []},
+        }
+
+        def fake_read_json(request, *, timeout_val: int):
+            parsed = urllib.parse.urlparse(request.full_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            calls.append((parsed.path, params))
+            if parsed.path.endswith("/suggest/search"):
+                return suggest_payload, None
+            if params["q"] == ["kohl's eastvale hours"]:
+                return recovery_payload, None
+            return initial_payload, None
+
+        with patch.object(brave_search, "_read_json", side_effect=fake_read_json):
+            result = brave_search.integration_web_search(
+                "what time does Cole's closed in east bell",
+                country="us",
+                language="en",
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0], "/res/v1/web/search")
+        self.assertEqual(calls[1][0], "/res/v1/suggest/search")
+        self.assertEqual(calls[1][1]["q"], ["Cole's east bell"])
+        self.assertEqual(calls[1][1]["count"], ["5"])
+        self.assertEqual(calls[1][1]["country"], ["US"])
+        self.assertEqual(calls[1][1]["lang"], ["en"])
+        self.assertEqual(calls[2][1]["q"], ["kohl's eastvale hours"])
+        self.assertTrue(result["autosuggest_attempted"])
+        self.assertEqual(result["autosuggest_query"], "Cole's east bell")
+        self.assertEqual(result["suggested_query"], "kohl's eastvale")
+        self.assertTrue(result["recovery_applied"])
+        self.assertEqual(result["recovery_query"], "kohl's eastvale hours")
+        self.assertEqual(result["effective_query"], "kohl's eastvale hours")
+        self.assertEqual(result["results"][0]["title"], "Kohl's Eastvale")
+        self.assertIn("Hours today: Sunday 09:00-21:00", result["results"][0]["snippet"])
+
+    def test_autosuggest_keeps_original_results_without_a_close_suggestion(self) -> None:
+        self.configure()
+        initial_payload = {
+            "query": {
+                "original": "what time does Cole's closed in east bell",
+                "more_results_available": False,
+            },
+            "web": {
+                "results": [
+                    {
+                        "title": "Cole Elementary - Bell Schedule",
+                        "url": "https://school.example/bell-schedule",
+                        "description": "School schedule.",
+                    }
+                ]
+            },
+        }
+        suggest_payload = {
+            "results": [
+                {"query": "cole elementary bell schedule"},
+                {"query": "east bell road construction"},
+            ]
+        }
+        calls: list[str] = []
+
+        def fake_read_json(request, *, timeout_val: int):
+            path = urllib.parse.urlparse(request.full_url).path
+            calls.append(path)
+            return (suggest_payload, None) if path.endswith("/suggest/search") else (initial_payload, None)
+
+        with patch.object(brave_search, "_read_json", side_effect=fake_read_json):
+            result = brave_search.integration_web_search("what time does Cole's closed in east bell")
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(result["autosuggest_attempted"])
+        self.assertIsNone(result["suggested_query"])
+        self.assertFalse(result["recovery_applied"])
+        self.assertEqual(result["results"][0]["title"], "Cole Elementary - Bell Schedule")
+
+    def test_autosuggest_is_skipped_when_initial_results_have_hours_signal(self) -> None:
+        self.configure()
+        payload = {
+            "query": {"original": "when does kohls close in eastvale", "more_results_available": False},
+            "web": {
+                "results": [
+                    {
+                        "title": "Kohl's Eastvale Store Hours",
+                        "url": "https://www.kohls.com/stores/ca/eastvale.shtml",
+                        "description": "Opening hours and store information.",
+                    }
+                ]
+            },
+        }
+
+        with patch.object(brave_search, "_read_json", return_value=(payload, None)) as read_json:
+            result = brave_search.integration_web_search("when does kohls close in eastvale")
+
+        self.assertEqual(read_json.call_count, 1)
+        self.assertFalse(result["autosuggest_attempted"])
+        self.assertFalse(result["recovery_applied"])
+
     def test_last_supported_page_does_not_offer_an_invalid_next_page(self) -> None:
         self.configure()
         payload = {

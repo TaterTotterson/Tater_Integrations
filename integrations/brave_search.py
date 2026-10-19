@@ -1,6 +1,7 @@
 from __future__ import annotations
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -13,9 +14,53 @@ from helpers import redis_client
 
 BRAVE_SEARCH_SETTINGS_KEY = "brave_search_settings"
 BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_SUGGEST_API_URL = "https://api.search.brave.com/res/v1/suggest/search"
 BRAVE_SEARCH_DEFAULT_TIMEOUT_SECONDS = 15
 BRAVE_SEARCH_MAX_RESPONSE_BYTES = int(os.getenv("TATER_WEB_SEARCH_MAX_RESPONSE_BYTES", "2000000"))
 BRAVE_SEARCH_MAX_SNIPPET_CHARS = int(os.getenv("TATER_WEB_SEARCH_MAX_SNIPPET_CHARS", "600"))
+BRAVE_SEARCH_AUTOSUGGEST_COUNT = 5
+BRAVE_SEARCH_AUTOSUGGEST_MIN_SIMILARITY = 0.60
+
+_LOCAL_HOURS_TERMS = re.compile(r"\b(?:open|opens|opened|opening|close|closes|closed|closing|hour|hours)\b", re.IGNORECASE)
+_LOCAL_RESULT_TERMS = re.compile(
+    r"\b(?:business|hours?|opening hours?|open now|closes?|store locator)\b",
+    re.IGNORECASE,
+)
+_AUTOSUGGEST_FILLER_WORDS = {
+    "a",
+    "an",
+    "are",
+    "at",
+    "close",
+    "closed",
+    "closes",
+    "closing",
+    "did",
+    "do",
+    "does",
+    "for",
+    "hour",
+    "hours",
+    "in",
+    "is",
+    "me",
+    "near",
+    "now",
+    "open",
+    "opened",
+    "opening",
+    "opens",
+    "please",
+    "the",
+    "time",
+    "today",
+    "tonight",
+    "was",
+    "were",
+    "what",
+    "when",
+    "will",
+}
 
 INTEGRATION = {
     "id": "brave_search",
@@ -109,6 +154,109 @@ def _truncate_snippet(value: Any) -> str:
 def _display_url(url: str) -> str:
     parsed = urllib.parse.urlparse(_text(url))
     return parsed.netloc or _text(url)
+
+
+def _api_request(
+    api_url: str,
+    params: Dict[str, Any],
+    *,
+    api_key: str,
+    timeout_val: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    req = urllib.request.Request(
+        api_url + "?" + urllib.parse.urlencode(params, doseq=True),
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Tater-AgentLab/1.0",
+            "X-Subscription-Token": api_key,
+        },
+    )
+    return _read_json(req, timeout_val=timeout_val)
+
+
+def _payload_error_message(payload: Dict[str, Any]) -> str:
+    error_payload = payload.get("error")
+    if isinstance(error_payload, dict):
+        return _text(error_payload.get("detail") or error_payload.get("message") or error_payload.get("code"))
+    return _text(error_payload)
+
+
+def _payload_rows(payload: Dict[str, Any], result_type: str) -> List[Dict[str, Any]]:
+    section = payload.get(result_type)
+    if not isinstance(section, dict) or not isinstance(section.get("results"), list):
+        return []
+    return [item for item in section["results"] if isinstance(item, dict)]
+
+
+def _is_local_hours_query(query: str) -> bool:
+    return bool(_LOCAL_HOURS_TERMS.search(query))
+
+
+def _has_local_result_signal(rows: List[Dict[str, Any]]) -> bool:
+    text = " ".join(
+        f"{_text(item.get('title'))} {_text(item.get('description'))}"
+        for item in rows[:3]
+    )
+    return bool(_LOCAL_RESULT_TERMS.search(text))
+
+
+def _compact_autosuggest_query(query: str) -> str:
+    tokens = re.findall(r"[\w'’.-]+", query, flags=re.UNICODE)
+    retained = [token for token in tokens if token.casefold().strip(".'’-") not in _AUTOSUGGEST_FILLER_WORDS]
+    return " ".join(retained) if len(retained) >= 2 else ""
+
+
+def _similarity_text(value: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", _text(value).casefold()))
+
+
+def _select_autosuggest_query(source_query: str, payload: Dict[str, Any]) -> str:
+    source = _similarity_text(source_query)
+    source_tokens = source.split()
+    if len(source_tokens) < 2:
+        return ""
+    rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidate_query = _text(row.get("query"))
+        candidate = _similarity_text(candidate_query)
+        candidate_tokens = candidate.split()
+        if not candidate or candidate == source:
+            continue
+        if not max(1, len(source_tokens) - 1) <= len(candidate_tokens) <= len(source_tokens):
+            continue
+        similarity = SequenceMatcher(None, source, candidate).ratio()
+        if similarity >= BRAVE_SEARCH_AUTOSUGGEST_MIN_SIMILARITY:
+            return candidate_query
+    return ""
+
+
+def _autosuggest_query(
+    query: str,
+    *,
+    api_key: str,
+    country: str,
+    language: str,
+    timeout_val: int,
+) -> str:
+    params: Dict[str, Any] = {
+        "q": query,
+        "count": BRAVE_SEARCH_AUTOSUGGEST_COUNT,
+    }
+    if country and re.fullmatch(r"[a-z]{2}", country):
+        params["country"] = country.upper()
+    if language and re.fullmatch(r"[a-z]{2}", language):
+        params["lang"] = language
+    payload, error = _api_request(
+        BRAVE_SUGGEST_API_URL,
+        params,
+        api_key=api_key,
+        timeout_val=timeout_val,
+    )
+    if error or not payload or payload.get("error"):
+        return ""
+    return _select_autosuggest_query(query, payload)
 
 
 def _location_address(item: Dict[str, Any]) -> str:
@@ -210,9 +358,15 @@ def _success(
     corrected_query: str,
     cleaned_query: str,
     spellcheck_off: Optional[bool],
+    autosuggest_attempted: bool,
+    autosuggest_query: str,
+    suggested_query: str,
+    recovery_applied: bool,
+    recovery_query: str,
+    effective_query_override: str,
     has_more: bool,
 ) -> Dict[str, Any]:
-    effective_query = corrected_query or cleaned_query or original_query or query
+    effective_query = effective_query_override or corrected_query or cleaned_query or original_query or query
     spellcheck_applied = bool(corrected_query and corrected_query.casefold() != original_query.casefold())
     next_start = start_index + max_results if has_more and results else None
     return {
@@ -227,6 +381,11 @@ def _success(
         "effective_query": effective_query,
         "spellcheck_applied": spellcheck_applied,
         "spellcheck_off": spellcheck_off,
+        "autosuggest_attempted": autosuggest_attempted,
+        "autosuggest_query": autosuggest_query or None,
+        "suggested_query": suggested_query or None,
+        "recovery_applied": recovery_applied,
+        "recovery_query": recovery_query or None,
         "start": start_index,
         "count": len(results),
         "num_results": max_results,
@@ -314,37 +473,99 @@ def integration_web_search(
     if language_val and re.fullmatch(r"[a-z]{2}", language_val):
         params["search_lang"] = language_val
 
-    req = urllib.request.Request(
-        BRAVE_SEARCH_API_URL + "?" + urllib.parse.urlencode(params, doseq=True),
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "Tater-AgentLab/1.0",
-            "X-Subscription-Token": settings.get("BRAVE_API_KEY") or "",
-        },
+    api_key = settings.get("BRAVE_API_KEY") or ""
+    payload, error = _api_request(
+        BRAVE_SEARCH_API_URL,
+        params,
+        api_key=api_key,
+        timeout_val=timeout_val,
     )
-    payload, error = _read_json(req, timeout_val=timeout_val)
     if error:
         return error
+    if not payload:
+        return _error("Invalid response from Brave Search.")
     if payload.get("error"):
-        error_payload = payload.get("error")
-        if isinstance(error_payload, dict):
-            error_message = _text(error_payload.get("detail") or error_payload.get("message") or error_payload.get("code"))
-        else:
-            error_message = _text(error_payload)
-        return _error(error_message or "Unknown Brave Search error.")
+        return _error(_payload_error_message(payload) or "Unknown Brave Search error.")
 
-    query_payload = payload.get("query") if isinstance(payload.get("query"), dict) else {}
-    original_query = _text(query_payload.get("original")) or q
-    corrected_query = _text(query_payload.get("altered"))
-    cleaned_query = _text(query_payload.get("cleaned"))
-    spellcheck_off_value = query_payload.get("spellcheck_off")
+    initial_query_payload = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+    original_query = _text(initial_query_payload.get("original")) or q
+    corrected_query = _text(initial_query_payload.get("altered"))
+    cleaned_query = _text(initial_query_payload.get("cleaned"))
+    spellcheck_off_value = initial_query_payload.get("spellcheck_off")
     spellcheck_off = spellcheck_off_value if isinstance(spellcheck_off_value, bool) else None
-    location_payload = payload.get("locations") if isinstance(payload.get("locations"), dict) else {}
-    web_payload = payload.get("web") if isinstance(payload.get("web"), dict) else {}
+    initial_location_rows = _payload_rows(payload, "locations")
+    initial_web_rows = _payload_rows(payload, "web")
+
+    autosuggest_attempted = False
+    autosuggest_input = ""
+    suggested_query = ""
+    recovery_applied = False
+    recovery_query = ""
+    effective_query_override = ""
+    selected_payload = payload
+
+    should_try_autosuggest = (
+        start_index == 1
+        and not site_val
+        and not corrected_query
+        and _is_local_hours_query(q)
+        and not initial_location_rows
+        and not _has_local_result_signal(initial_web_rows)
+    )
+    if should_try_autosuggest:
+        autosuggest_input = _compact_autosuggest_query(q)
+        if autosuggest_input:
+            autosuggest_attempted = True
+            suggested_query = _autosuggest_query(
+                autosuggest_input,
+                api_key=api_key,
+                country=country_val,
+                language=language_val,
+                timeout_val=timeout_val,
+            )
+            if suggested_query:
+                recovery_query = (
+                    suggested_query
+                    if _is_local_hours_query(suggested_query)
+                    else f"{suggested_query} hours"
+                )
+                recovery_params = dict(params)
+                recovery_params["q"] = recovery_query
+                recovery_params["offset"] = 0
+                recovery_payload, recovery_error = _api_request(
+                    BRAVE_SEARCH_API_URL,
+                    recovery_params,
+                    api_key=api_key,
+                    timeout_val=timeout_val,
+                )
+                if (
+                    not recovery_error
+                    and recovery_payload
+                    and not recovery_payload.get("error")
+                    and _payload_rows(recovery_payload, "locations")
+                ):
+                    selected_payload = recovery_payload
+                    recovery_applied = True
+                    recovery_query_payload = (
+                        recovery_payload.get("query")
+                        if isinstance(recovery_payload.get("query"), dict)
+                        else {}
+                    )
+                    corrected_query = _text(recovery_query_payload.get("altered"))
+                    cleaned_query = _text(recovery_query_payload.get("cleaned"))
+                    recovery_spellcheck_off = recovery_query_payload.get("spellcheck_off")
+                    spellcheck_off = recovery_spellcheck_off if isinstance(recovery_spellcheck_off, bool) else None
+                    effective_query_override = corrected_query or cleaned_query or recovery_query
+
+    query_payload = (
+        selected_payload.get("query")
+        if isinstance(selected_payload.get("query"), dict)
+        else {}
+    )
+    location_rows = _payload_rows(selected_payload, "locations")
+    web_rows = _payload_rows(selected_payload, "web")
     results: List[Dict[str, Any]] = []
     seen_urls = set()
-    location_rows = location_payload.get("results") if isinstance(location_payload.get("results"), list) else []
-    web_rows = web_payload.get("results") if isinstance(web_payload.get("results"), list) else []
     for rows, is_location in ((location_rows, True), (web_rows, False)):
         for item in rows:
             if not isinstance(item, dict):
@@ -376,6 +597,12 @@ def integration_web_search(
         corrected_query=corrected_query,
         cleaned_query=cleaned_query,
         spellcheck_off=spellcheck_off,
+        autosuggest_attempted=autosuggest_attempted,
+        autosuggest_query=autosuggest_input,
+        suggested_query=suggested_query,
+        recovery_applied=recovery_applied,
+        recovery_query=recovery_query,
+        effective_query_override=effective_query_override,
         has_more=has_more,
     )
 
