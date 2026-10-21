@@ -1,11 +1,12 @@
 from __future__ import annotations
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import asyncio
 import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -97,6 +98,11 @@ INTEGRATION = {
         "cover",
         "climate",
         "media_player",
+        "appliance",
+        "washer",
+        "dryer",
+        "dishwasher",
+        "remaining_time",
     ],
     "fields": [
         {
@@ -771,8 +777,99 @@ def _homeassistant_rest_get(base_url: Any, token: Any, path: str, *, timeout_s: 
         return []
 
 
-def _homeassistant_entity_details(row: Dict[str, Any]) -> Dict[str, Any]:
+_HOMEASSISTANT_APPLIANCE_KIND_TERMS: Dict[str, tuple[str, ...]] = {
+    "washer": ("washer", "washing machine", "clothes washer"),
+    "dryer": ("dryer", "tumble dryer", "clothes dryer"),
+    "dishwasher": ("dishwasher", "dish washer"),
+}
+
+
+def _homeassistant_semantic_text(*values: Any) -> str:
+    return " ".join(
+        token
+        for token in (
+            re.sub(r"[^a-z0-9]+", " ", _text(value).lower()).strip()
+            for value in values
+        )
+        if token
+    )
+
+
+def _homeassistant_registry_rows(
+    entity_id: str,
+    registry_context: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    context = registry_context if isinstance(registry_context, dict) else {}
+    entity = (context.get("entities") or {}).get(entity_id) or {}
+    device = (context.get("devices") or {}).get(_text(entity.get("device_id"))) or {}
+    return entity, device
+
+
+def _homeassistant_entity_semantics(
+    entity_id: str,
+    attrs: Dict[str, Any],
+    registry_context: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, str]:
+    """Return provider-neutral appliance and property metadata for one HA entity."""
+    entity, device = _homeassistant_registry_rows(entity_id, registry_context)
+    property_text = _homeassistant_semantic_text(
+        entity_id.split(".", 1)[-1],
+        attrs.get("friendly_name"),
+        entity.get("name"),
+        entity.get("original_name"),
+        entity.get("translation_key"),
+    )
+    appliance_text = _homeassistant_semantic_text(
+        property_text,
+        device.get("name_by_user"),
+        device.get("name"),
+        device.get("model"),
+        device.get("model_id"),
+    )
+
+    appliance_type = ""
+    for candidate, terms in _HOMEASSISTANT_APPLIANCE_KIND_TERMS.items():
+        if any(re.search(rf"\b{re.escape(term)}\b", appliance_text) for term in terms):
+            appliance_type = candidate
+            break
+
+    entity_property = ""
+    if (
+        ("time" in property_text and re.search(r"\b(remain(?:ing)?|left)\b", property_text))
+        or re.search(r"\b(completion|finish|end) time\b", property_text)
+    ):
+        entity_property = "remaining_time"
+    elif re.search(
+        r"\b(current status|current state|cycle status|cycle state|machine status|machine state|operation status|operation state)\b",
+        property_text,
+    ):
+        entity_property = "current_status"
+    elif re.search(r"\b(progress|percent complete|percentage complete)\b", property_text):
+        entity_property = "progress"
+    elif re.search(r"\bcycle\b", property_text):
+        entity_property = "cycle"
+
+    return {
+        "appliance_type": appliance_type,
+        "entity_property": entity_property,
+        "parent_device_id": _text(entity.get("device_id")),
+        "parent_device_name": _text(device.get("name_by_user") or device.get("name")),
+        "manufacturer": _text(device.get("manufacturer")),
+        "model": _text(device.get("model") or device.get("model_id")),
+        "entity_platform": _text(entity.get("platform")),
+        "entity_original_name": _text(entity.get("original_name") or entity.get("name")),
+    }
+
+
+def _homeassistant_entity_details(
+    row: Dict[str, Any],
+    *,
+    entity_id: str = "",
+    registry_context: Optional[Dict[str, Dict[str, Any]]] = None,
+    related_entity_ids: Optional[list[str]] = None,
+) -> Dict[str, Any]:
     attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+    entity, _device = _homeassistant_registry_rows(entity_id, registry_context)
     details: Dict[str, Any] = {}
     for key in (
         "unit_of_measurement",
@@ -785,12 +882,32 @@ def _homeassistant_entity_details(row: Dict[str, Any]) -> Dict[str, Any]:
         "supported_features",
     ):
         value = attrs.get(key) if key in attrs else row.get(key)
+        if key == "device_class" and value in (None, ""):
+            value = entity.get("device_class") or entity.get("original_device_class")
         if value not in (None, ""):
             details[key] = value
     for key in ("temperature", "humidity", "illuminance", "pressure", "voltage", "power", "energy"):
         value = attrs.get(key)
         if value not in (None, ""):
             details[key] = value
+    semantics = _homeassistant_entity_semantics(entity_id, attrs, registry_context)
+    semantic_keys = {
+        "appliance_type": "appliance_type",
+        "entity_property": "entity_property",
+        "parent_device_id": "homeassistant_device_id",
+        "parent_device_name": "parent_device_name",
+        "manufacturer": "manufacturer",
+        "model": "model",
+        "entity_platform": "homeassistant_platform",
+        "entity_original_name": "entity_original_name",
+    }
+    for source_key, target_key in semantic_keys.items():
+        value = semantics.get(source_key)
+        if value:
+            details[target_key] = value
+    related = [_text(value) for value in (related_entity_ids or []) if _text(value)]
+    if related:
+        details["related_entity_ids"] = related
     return details
 
 
@@ -908,9 +1025,18 @@ def _homeassistant_camera_supports_clip(attrs: Dict[str, Any]) -> bool:
     return bool(supported_features & HOMEASSISTANT_CAMERA_STREAM_FEATURE) and bool(shutil.which("ffmpeg"))
 
 
-def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) -> list[str]:
+def _homeassistant_entity_capabilities(
+    entity_id: str,
+    attrs: Dict[str, Any],
+    registry_context: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> list[str]:
     domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
-    device_class = _text(attrs.get("device_class")).lower()
+    entity, _device = _homeassistant_registry_rows(entity_id, registry_context)
+    device_class = _text(
+        attrs.get("device_class")
+        or entity.get("device_class")
+        or entity.get("original_device_class")
+    ).lower()
     unit = _text(attrs.get("unit_of_measurement")).lower()
     name_hint = f"{entity_id} {_text(attrs.get('friendly_name'))}".lower()
     caps = [domain]
@@ -982,6 +1108,14 @@ def _homeassistant_entity_capabilities(entity_id: str, attrs: Dict[str, Any]) ->
             add("leak")
     if any(token in name_hint for token in ("doorbell", "ring", "button", "press")):
         add("doorbell")
+    semantics = _homeassistant_entity_semantics(entity_id, attrs, registry_context)
+    appliance_type = _text(semantics.get("appliance_type"))
+    entity_property = _text(semantics.get("entity_property"))
+    if appliance_type:
+        add("appliance")
+        add(appliance_type)
+    if entity_property:
+        add(entity_property)
     return caps
 
 
@@ -1133,6 +1267,7 @@ def integration_devices() -> Dict[str, Any]:
             )
             return {"devices": [], "error": message, "message": message}
     devices: list[dict] = []
+    visible_rows: list[tuple[Dict[str, Any], str, Dict[str, Any]]] = []
     state_count = 0
     for row in states if isinstance(states, list) else []:
         if not isinstance(row, dict):
@@ -1149,15 +1284,41 @@ def integration_devices() -> Dict[str, Any]:
             assist_policy=assist_policy,
         ):
             continue
+        visible_rows.append((row, entity_id, attrs))
+
+    related_by_device: Dict[str, list[str]] = {}
+    for _row, entity_id, _attrs in visible_rows:
+        registry_entity, _registry_device = _homeassistant_registry_rows(entity_id, registry_context)
+        parent_device_id = _text(registry_entity.get("device_id"))
+        if parent_device_id:
+            related_by_device.setdefault(parent_device_id, []).append(entity_id)
+
+    for row, entity_id, attrs in visible_rows:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else "entity"
         state = _text(row.get("state"))
-        capabilities = _homeassistant_entity_capabilities(entity_id, attrs)
+        registry_entity, registry_device = _homeassistant_registry_rows(entity_id, registry_context)
+        parent_device_id = _text(registry_entity.get("device_id"))
+        capabilities = _homeassistant_entity_capabilities(entity_id, attrs, registry_context)
         actions = _homeassistant_entity_actions(entity_id, capabilities)
         room = _homeassistant_entity_room(entity_id, attrs, registry_context)
+        aliases: list[str] = []
+        seen_aliases: set[str] = set()
+        for value in (
+            registry_device.get("name_by_user"),
+            registry_device.get("name"),
+            registry_entity.get("name"),
+            registry_entity.get("original_name"),
+        ):
+            alias = _text(value)
+            alias_key = alias.casefold()
+            if alias and alias_key not in seen_aliases:
+                seen_aliases.add(alias_key)
+                aliases.append(alias)
         devices.append(
             {
                 "id": entity_id,
                 "name": _text(attrs.get("friendly_name")) or entity_id,
+                "aliases": aliases,
                 "type": domain,
                 "ref": entity_id,
                 "capabilities": capabilities,
@@ -1168,7 +1329,12 @@ def integration_devices() -> Dict[str, Any]:
                 "area": room,
                 "state": state,
                 "status": state,
-                "details": _homeassistant_entity_details(row),
+                "details": _homeassistant_entity_details(
+                    row,
+                    entity_id=entity_id,
+                    registry_context=registry_context,
+                    related_entity_ids=related_by_device.get(parent_device_id) or [],
+                ),
             }
         )
     if entity_scope == HOMEASSISTANT_ENTITY_SCOPE_ASSIST:

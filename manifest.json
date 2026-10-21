@@ -75,11 +75,11 @@
       "id": "homeassistant",
       "name": "Home Assistant",
       "description": "Shared Home Assistant endpoint and token for devices, camera snapshots and short camera clips.",
-      "version": "1.5.0",
+      "version": "1.6.0",
       "entry": "integrations/homeassistant.py",
-      "sha256": "54a924a7044d7d75c2e200b7f0c6a3d7d65e20256bb6179dbedecd329e45a253",
+      "sha256": "cbe15d0358baa2fe39ce07bc5f7fa4567762b1891e7fd315bcfa198fa5bbf3e7",
       "required": false,
-      "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "video_clip", "cover", "climate", "media_player", "remote", "scene", "script"]
+      "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "video_clip", "cover", "climate", "media_player", "remote", "scene", "script", "appliance", "washer", "dryer", "dishwasher", "remaining_time"]
     },
     {
       "id": "homekit",
