@@ -108,9 +108,10 @@ class HomeAssistantEventSourceTests(unittest.TestCase):
             capabilities = homeassistant._homeassistant_entity_capabilities("camera.front", attrs)
 
         self.assertIn("video_clip", capabilities)
+        self.assertIn("stream", capabilities)
         self.assertEqual(
             homeassistant._homeassistant_entity_actions("camera.front", capabilities),
-            ["camera_snapshot", "camera_clip"],
+            ["camera_snapshot", "camera_stream", "camera_clip"],
         )
 
     def test_camera_without_stream_does_not_advertise_clip(self) -> None:
@@ -125,6 +126,18 @@ class HomeAssistantEventSourceTests(unittest.TestCase):
             homeassistant._homeassistant_entity_actions("camera.front", capabilities),
             ["camera_snapshot"],
         )
+
+    def test_camera_stream_action_returns_hls_url_without_downloading_video(self) -> None:
+        with patch.object(
+            homeassistant,
+            "_homeassistant_camera_stream_url",
+            return_value="https://ha.invalid/api/hls/token/playlist.m3u8",
+        ) as stream:
+            result = homeassistant.run_integration_device_action("camera_stream", "camera.front", {})
+
+        self.assertEqual(result["format"], "hls")
+        self.assertEqual(result["url"], "https://ha.invalid/api/hls/token/playlist.m3u8")
+        stream.assert_called_once_with("camera.front")
 
 
 if __name__ == "__main__":

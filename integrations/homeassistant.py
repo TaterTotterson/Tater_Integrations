@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import asyncio
 import io
@@ -76,7 +76,7 @@ _ASSIST_POLICY_CACHE: Dict[str, Any] = {
 INTEGRATION = {
     "id": "homeassistant",
     "name": "Home Assistant",
-    "description": "Shared Home Assistant endpoint and token for devices, camera snapshots and short camera clips.",
+    "description": "Shared Home Assistant endpoint and token for devices, live camera streams, snapshots, and short camera clips.",
     "badge": "HA",
     "order": 10,
     "capabilities": [
@@ -94,6 +94,7 @@ INTEGRATION = {
         "leak",
         "battery",
         "camera",
+        "live_stream",
         "video_clip",
         "cover",
         "climate",
@@ -1018,11 +1019,15 @@ def _homeassistant_entity_event_sources(
 
 
 def _homeassistant_camera_supports_clip(attrs: Dict[str, Any]) -> bool:
+    return _homeassistant_camera_supports_stream(attrs) and bool(shutil.which("ffmpeg"))
+
+
+def _homeassistant_camera_supports_stream(attrs: Dict[str, Any]) -> bool:
     try:
         supported_features = int(float(attrs.get("supported_features") or 0))
     except (TypeError, ValueError):
         supported_features = 0
-    return bool(supported_features & HOMEASSISTANT_CAMERA_STREAM_FEATURE) and bool(shutil.which("ffmpeg"))
+    return bool(supported_features & HOMEASSISTANT_CAMERA_STREAM_FEATURE)
 
 
 def _homeassistant_entity_capabilities(
@@ -1048,6 +1053,8 @@ def _homeassistant_entity_capabilities(
     if domain == "camera":
         add("camera")
         add("snapshot")
+        if _homeassistant_camera_supports_stream(attrs):
+            add("stream")
         if _homeassistant_camera_supports_clip(attrs):
             add("video_clip")
     if domain == "light":
@@ -1163,6 +1170,8 @@ def _homeassistant_entity_actions(entity_id: str, capabilities: list[str]) -> li
         return ["run"]
     if domain == "camera" or "snapshot" in caps:
         actions = ["camera_snapshot"]
+        if "stream" in caps:
+            actions.append("camera_stream")
         if "video_clip" in caps:
             actions.append("camera_clip")
         return actions
@@ -1481,6 +1490,8 @@ def run_integration_device_action(action_id: str, device_id: str, payload: Dict[
     if action in {"camera_snapshot", "snapshot"}:
         content, content_type = get_camera_snapshot(entity_id)
         return {"ok": True, "bytes": content, "content_type": content_type}
+    if action in {"camera_stream", "stream", "live_stream"}:
+        return {"ok": True, "url": _homeassistant_camera_stream_url(entity_id), "format": "hls"}
     if action in {"camera_clip", "video_clip", "clip"}:
         content, content_type, metadata = get_camera_clip(entity_id, payload)
         return {"ok": True, "bytes": content, "content_type": content_type, **metadata}

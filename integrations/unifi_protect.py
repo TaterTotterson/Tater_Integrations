@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import base64
 import contextlib
@@ -18,7 +18,7 @@ import time
 import warnings
 import wave
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -33,8 +33,10 @@ UNIFI_PROTECT_API_KEY_KEY = "tater:unifi_protect:api_key"
 UNIFI_PROTECT_USERNAME_KEY = "tater:unifi_protect:username"
 UNIFI_PROTECT_PASSWORD_KEY = "tater:unifi_protect:password"
 UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY = "tater:unifi_protect:announcement_volume"
+UNIFI_PROTECT_STREAM_QUALITY_KEY = "tater:unifi_protect:stream_quality"
 UNIFI_PROTECT_DEFAULT_BASE_URL = "https://10.4.20.127"
 UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME = 100
+UNIFI_PROTECT_DEFAULT_STREAM_QUALITY = "low"
 DEFAULT_UNIFI_PROTECT_AUDIO_TIMEOUT_SECONDS = 90.0
 INTEGRATION_RUNTIME_POLL_SECONDS = 2
 UNIFI_PROTECT_CAMERA_PATHS = [
@@ -59,11 +61,12 @@ def _subprocess_spawn_kwargs() -> Dict[str, Any]:
 INTEGRATION = {
     "id": "unifi_protect",
     "name": "UniFi Protect",
-    "description": "UniFi Protect cameras, recorded clips, sensors, and direct speaker announcements.",
+    "description": "UniFi Protect live cameras, recorded clips, sensors, and direct speaker announcements.",
     "badge": "PRO",
     "order": 70,
     "capabilities": [
         "camera",
+        "live_stream",
         "video_clip",
         "doorbell",
         "motion",
@@ -108,6 +111,17 @@ INTEGRATION = {
             "description": "Required with the local username for recorded clip export and speaker-volume control.",
         },
         {
+            "key": "unifi_protect_stream_quality",
+            "label": "Echo Live Stream Quality",
+            "type": "select",
+            "default": UNIFI_PROTECT_DEFAULT_STREAM_QUALITY,
+            "options": ["low", "medium", "high"],
+            "description": (
+                "Preferred RTSPS quality for Room Vision on Echo screens. Enable at least one RTSPS quality "
+                "in that camera's UniFi Protect advanced settings; Tater never enables or deletes streams."
+            ),
+        },
+        {
             "key": "unifi_protect_announcement_volume",
             "label": "Announcement Volume",
             "type": "number",
@@ -145,12 +159,18 @@ def _as_int(value: Any, default: int, *, minimum: Optional[int] = None, maximum:
     return out
 
 
+def _unifi_stream_quality(value: Any) -> str:
+    quality = _text(value).lower()
+    return quality if quality in {"low", "medium", "high"} else UNIFI_PROTECT_DEFAULT_STREAM_QUALITY
+
+
 def read_unifi_protect_settings(client: Any = None) -> Dict[str, str]:
     store = client or redis_client
     base = _text(store.get(UNIFI_PROTECT_BASE_URL_KEY) or UNIFI_PROTECT_DEFAULT_BASE_URL).rstrip("/")
     api_key = _text(store.get(UNIFI_PROTECT_API_KEY_KEY))
     username = _text(store.get(UNIFI_PROTECT_USERNAME_KEY))
     password = _text(store.get(UNIFI_PROTECT_PASSWORD_KEY))
+    stream_quality = _unifi_stream_quality(store.get(UNIFI_PROTECT_STREAM_QUALITY_KEY))
     announcement_volume = _as_int(
         store.get(UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY),
         UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
@@ -162,6 +182,7 @@ def read_unifi_protect_settings(client: Any = None) -> Dict[str, str]:
         "api_key": api_key,
         "username": username,
         "password": password,
+        "stream_quality": stream_quality,
         "announcement_volume": str(announcement_volume),
         "UNIFI_PROTECT_BASE_URL": base or UNIFI_PROTECT_DEFAULT_BASE_URL,
         "UNIFI_PROTECT_API_KEY": api_key,
@@ -174,6 +195,7 @@ def save_unifi_protect_settings(
     api_key: Any = None,
     username: Any = None,
     password: Any = None,
+    stream_quality: Any = None,
     announcement_volume: Any = None,
     client: Any = None,
 ) -> Dict[str, str]:
@@ -183,6 +205,9 @@ def save_unifi_protect_settings(
     next_api_key = _text(current.get("api_key") if api_key is None else api_key)
     next_username = _text(current.get("username") if username is None else username)
     next_password = _text(current.get("password") if password is None else password)
+    next_stream_quality = _unifi_stream_quality(
+        current.get("stream_quality") if stream_quality is None else stream_quality
+    )
     next_announcement_volume = _as_int(
         current.get("announcement_volume") if announcement_volume is None else announcement_volume,
         UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
@@ -193,6 +218,7 @@ def save_unifi_protect_settings(
     store.set(UNIFI_PROTECT_API_KEY_KEY, next_api_key)
     store.set(UNIFI_PROTECT_USERNAME_KEY, next_username)
     store.set(UNIFI_PROTECT_PASSWORD_KEY, next_password)
+    store.set(UNIFI_PROTECT_STREAM_QUALITY_KEY, next_stream_quality)
     store.set(UNIFI_PROTECT_ANNOUNCEMENT_VOLUME_KEY, str(next_announcement_volume))
     return read_unifi_protect_settings(store)
 
@@ -547,7 +573,7 @@ def _unifi_camera_smart_detect_types(row: Dict[str, Any]) -> List[str]:
 
 
 def _unifi_camera_capabilities(row: Dict[str, Any], *, clip_available: bool = False) -> List[str]:
-    caps = ["camera", "snapshot", "motion"]
+    caps = ["camera", "snapshot", "stream", "motion"]
     if clip_available:
         caps.append("video_clip")
     for smart_type in _unifi_camera_smart_detect_types(row):
@@ -828,9 +854,15 @@ def integration_devices() -> Dict[str, Any]:
                 "type": "camera",
                 "ref": camera_entity or f"camera:{camera_id}",
                 "capabilities": _unifi_camera_capabilities(camera, clip_available=clip_available),
-                "actions": ["camera_snapshot", *(("camera_clip",) if clip_available else ())],
+                "actions": [
+                    "camera_snapshot",
+                    "camera_stream",
+                    *(("camera_clip",) if clip_available else ()),
+                    *(("camera_talkback",) if unifi_camera_has_speaker_hint(camera) else ()),
+                ],
                 "features": [
                     "snapshot",
+                    "live_stream",
                     *(("video_clip",) if clip_available else ()),
                     "motion",
                     *_unifi_camera_smart_detect_types(camera),
@@ -920,6 +952,7 @@ def read_integration_settings() -> Dict[str, Any]:
         "unifi_protect_api_key": settings.get("api_key", ""),
         "unifi_protect_username": settings.get("username", ""),
         "unifi_protect_password": settings.get("password", ""),
+        "unifi_protect_stream_quality": _unifi_stream_quality(settings.get("stream_quality")),
         "unifi_protect_announcement_volume": _as_int(
             settings.get("announcement_volume"),
             UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
@@ -935,6 +968,7 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         api_key=(payload or {}).get("unifi_protect_api_key"),
         username=(payload or {}).get("unifi_protect_username"),
         password=(payload or {}).get("unifi_protect_password"),
+        stream_quality=(payload or {}).get("unifi_protect_stream_quality"),
         announcement_volume=(payload or {}).get("unifi_protect_announcement_volume"),
     )
     return {
@@ -942,6 +976,7 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         "unifi_protect_api_key": saved.get("api_key", ""),
         "unifi_protect_username": saved.get("username", ""),
         "unifi_protect_password": saved.get("password", ""),
+        "unifi_protect_stream_quality": _unifi_stream_quality(saved.get("stream_quality")),
         "unifi_protect_announcement_volume": _as_int(
             saved.get("announcement_volume"),
             UNIFI_PROTECT_DEFAULT_ANNOUNCEMENT_VOLUME,
@@ -1630,6 +1665,45 @@ def get_camera_snapshot(device_id: Any) -> Tuple[bytes, str]:
     return ProtectClient().get_camera_snapshot(camera_id)
 
 
+def get_camera_stream(device_id: Any) -> Tuple[str, str, str]:
+    """Return an already-enabled local Protect RTSPS stream.
+
+    Creating a stream changes the camera's persistent Protect configuration and
+    exposes a bearer URL on the LAN. Tater therefore only reads existing stream
+    settings and leaves enabling or deleting them to the Protect administrator.
+    """
+    camera_id = unifi_camera_id_from_target(device_id)
+    if not camera_id:
+        raise ValueError("UniFi Protect camera id is required.")
+    response = unifi_protect_request(
+        "GET",
+        f"/proxy/protect/integration/v1/cameras/{quote(camera_id, safe='')}/rtsps-stream",
+        timeout_s=15.0,
+    )
+    streams = (
+        response.get("data")
+        if isinstance(response, dict) and isinstance(response.get("data"), dict)
+        else response
+    )
+    streams = streams if isinstance(streams, dict) else {}
+    preferred = _unifi_stream_quality(read_unifi_protect_settings().get("stream_quality"))
+    orders = {
+        "low": ("low", "medium", "high"),
+        "medium": ("medium", "low", "high"),
+        "high": ("high", "medium", "low"),
+    }
+    for quality in orders[preferred]:
+        stream_url = _text(streams.get(quality))
+        parsed = urlparse(stream_url)
+        if parsed.scheme.lower() not in {"rtsp", "rtsps"} or not parsed.hostname:
+            continue
+        return stream_url, parsed.scheme.lower(), quality
+    raise RuntimeError(
+        "No UniFi Protect RTSPS stream is enabled for this camera. Enable Low, Medium, or High "
+        "RTSPS in the camera's Protect advanced settings; snapshot fallback remains available."
+    )
+
+
 def _clip_timestamp_seconds(value: Any) -> float:
     if isinstance(value, (int, float)):
         parsed = float(value)
@@ -1733,9 +1807,17 @@ def get_camera_clip(device_id: Any, payload: Optional[Dict[str, Any]] = None) ->
 
 def run_integration_device_action(action_id: str, device_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     action = _text(action_id).lower()
+    if action == "camera_talkback":
+        return play_unifi_protect_audio_sync(
+            cameras=[device_id],
+            audio_bytes=bytes((payload or {}).get("audio_bytes") or b""),
+        )
     if action in {"camera_clip", "video_clip", "clip"}:
         content, content_type, metadata = get_camera_clip(device_id, payload)
         return {"ok": True, "bytes": content, "content_type": content_type, **metadata}
+    if action in {"camera_stream", "stream", "live_stream"}:
+        stream_url, stream_format, quality = get_camera_stream(device_id)
+        return {"ok": True, "url": stream_url, "format": stream_format, "quality": quality}
     if action not in {"camera_snapshot", "snapshot"}:
         raise KeyError(f"Unsupported UniFi Protect device action: {action_id}")
     content, content_type = get_camera_snapshot(device_id)

@@ -74,12 +74,12 @@
     {
       "id": "homeassistant",
       "name": "Home Assistant",
-      "description": "Shared Home Assistant endpoint and token for devices, camera snapshots and short camera clips.",
-      "version": "1.6.0",
+      "description": "Shared Home Assistant endpoint and token for devices, live camera streams, snapshots, and short camera clips.",
+      "version": "1.7.0",
       "entry": "integrations/homeassistant.py",
-      "sha256": "cbe15d0358baa2fe39ce07bc5f7fa4567762b1891e7fd315bcfa198fa5bbf3e7",
+      "sha256": "555eac29a36d3f7543dbf598a0333f580b8c245a4da6ba84686feeabd048d8f5",
       "required": false,
-      "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "video_clip", "cover", "climate", "media_player", "remote", "scene", "script", "appliance", "washer", "dryer", "dishwasher", "remaining_time"]
+      "capabilities": ["light", "switch", "plug", "fan", "sensor", "garage_door", "entry_sensor", "lock", "motion", "temperature", "humidity", "illuminance", "energy", "leak", "battery", "camera", "live_stream", "video_clip", "cover", "climate", "media_player", "remote", "scene", "script", "appliance", "washer", "dryer", "dishwasher", "remaining_time"]
     },
     {
       "id": "homekit",
@@ -181,12 +181,12 @@
     {
       "id": "unifi_protect",
       "name": "UniFi Protect",
-      "description": "UniFi Protect cameras, recorded clips, sensors, and direct speaker announcements.",
-      "version": "1.5.0",
+      "description": "UniFi Protect live cameras, recorded clips, sensors, and direct speaker announcements.",
+      "version": "1.6.0",
       "entry": "integrations/unifi_protect.py",
-      "sha256": "2ba4342203c557508625e00f5ea917c920d3fe8c294402dc423dc24f564ec42a",
+      "sha256": "75bbce9206e9b659165d06d2206fdc64b8075198a94faa4ce88674cbcd8e2001",
       "required": false,
-      "capabilities": ["camera", "video_clip", "doorbell", "motion", "entry_sensor", "temperature", "humidity", "illuminance", "leak", "battery", "speaker"]
+      "capabilities": ["camera", "live_stream", "video_clip", "doorbell", "motion", "entry_sensor", "temperature", "humidity", "illuminance", "leak", "battery", "speaker"]
     },
     {
       "id": "weather_api",

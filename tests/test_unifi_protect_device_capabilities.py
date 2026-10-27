@@ -40,6 +40,28 @@ from integrations import unifi_protect
 
 
 class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
+    def test_stream_quality_setting_round_trips_and_defaults_safely(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.values = {}
+
+            def get(self, key):
+                return self.values.get(key)
+
+            def set(self, key, value) -> None:
+                self.values[key] = value
+
+        store = Store()
+        self.assertEqual(
+            unifi_protect.read_unifi_protect_settings(store)["stream_quality"],
+            "low",
+        )
+        saved = unifi_protect.save_unifi_protect_settings(
+            stream_quality="medium",
+            client=store,
+        )
+        self.assertEqual(saved["stream_quality"], "medium")
+
     def test_explicit_doorbell_flag_adds_doorbell_capability_and_event(self) -> None:
         row = {
             "name": "Front Entry",
@@ -49,6 +71,7 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
 
         self.assertTrue(unifi_protect._unifi_camera_is_doorbell(row))
         self.assertIn("doorbell", unifi_protect._unifi_camera_capabilities(row))
+        self.assertIn("stream", unifi_protect._unifi_camera_capabilities(row))
         self.assertIn(
             "video_clip",
             unifi_protect._unifi_camera_capabilities(row, clip_available=True),
@@ -69,6 +92,27 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
             "video_clip",
             unifi_protect._unifi_camera_capabilities({}, clip_available=True),
         )
+
+    def test_device_directory_advertises_live_stream_action(self) -> None:
+        camera = {"id": "front-door", "name": "Front Door", "isConnected": True}
+        with (
+            patch.object(unifi_protect, "unifi_protect_configured", return_value=True),
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={"username": "", "password": ""},
+            ),
+            patch.object(
+                unifi_protect,
+                "_list_unifi_rows",
+                side_effect=[([camera], []), ([], [])],
+            ),
+        ):
+            result = unifi_protect.integration_devices()
+
+        self.assertEqual(len(result["devices"]), 1)
+        self.assertIn("camera_stream", result["devices"][0]["actions"])
+        self.assertIn("live_stream", result["devices"][0]["features"])
 
     def test_talkback_profile_matches_unifi_codec_container(self) -> None:
         cases = (
@@ -335,6 +379,93 @@ class UnifiProtectDeviceCapabilityTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["bytes"], b"video")
         self.assertEqual(result["content_type"], "video/mp4")
+
+    def test_camera_stream_action_prefers_configured_existing_rtsps_quality(self) -> None:
+        with (
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={"stream_quality": "medium"},
+            ),
+            patch.object(
+                unifi_protect,
+                "unifi_protect_request",
+                return_value={
+                    "high": "rtsps://protect.local:7441/high-token?enableSrtp",
+                    "medium": "rtsps://protect.local:7441/medium-token?enableSrtp",
+                    "low": "rtsps://protect.local:7441/low-token?enableSrtp",
+                },
+            ) as request,
+        ):
+            result = unifi_protect.run_integration_device_action(
+                "camera_stream",
+                "camera.unifi_front-door",
+                {},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "rtsps")
+        self.assertEqual(result["quality"], "medium")
+        self.assertEqual(result["url"], "rtsps://protect.local:7441/medium-token?enableSrtp")
+        request.assert_called_once_with(
+            "GET",
+            "/proxy/protect/integration/v1/cameras/front-door/rtsps-stream",
+            timeout_s=15.0,
+        )
+
+    def test_camera_stream_uses_enabled_fallback_without_creating_one(self) -> None:
+        with (
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={"stream_quality": "low"},
+            ),
+            patch.object(
+                unifi_protect,
+                "unifi_protect_request",
+                return_value={"low": None, "medium": "rtsps://protect.local:7441/medium-token"},
+            ) as request,
+        ):
+            stream_url, stream_format, quality = unifi_protect.get_camera_stream("front-door")
+
+        self.assertEqual(stream_url, "rtsps://protect.local:7441/medium-token")
+        self.assertEqual(stream_format, "rtsps")
+        self.assertEqual(quality, "medium")
+        self.assertEqual(request.call_args.args[0], "GET")
+
+    def test_camera_stream_requires_an_enabled_protect_stream(self) -> None:
+        with (
+            patch.object(
+                unifi_protect,
+                "read_unifi_protect_settings",
+                return_value={"stream_quality": "low"},
+            ),
+            patch.object(
+                unifi_protect,
+                "unifi_protect_request",
+                return_value={"high": None, "medium": None, "low": None},
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No UniFi Protect RTSPS stream is enabled"):
+                unifi_protect.get_camera_stream("front-door")
+
+    def test_camera_talkback_action_sends_audio_to_selected_camera(self) -> None:
+        with patch.object(
+            unifi_protect,
+            "play_unifi_protect_audio_sync",
+            return_value={"ok": True, "sent_count": 1},
+        ) as play:
+            result = unifi_protect.run_integration_device_action(
+                "camera_talkback",
+                "front-door",
+                {"audio_bytes": b"wav audio"},
+            )
+
+        self.assertTrue(result["ok"])
+        play.assert_called_once_with(
+            cameras=["front-door"],
+            audio_bytes=b"wav audio",
+        )
 
 
 if __name__ == "__main__":
