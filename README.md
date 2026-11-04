@@ -472,3 +472,9 @@ async def integration_runtime_event_allowed(*, kind, payload, client=None):
 ```
 
 Tater calls this hook before storing states or publishing events from generic integration pollers. Provider listeners that Tater already maintains, such as Home Assistant, use the same hook. If the hook is absent, runtime data is allowed. If it raises an exception, Tater blocks that item and records the filter error rather than silently exposing it.
+
+## License and trademarks
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+The Tater name and logo are governed by the [Tater Trademark Policy](TRADEMARKS.md).\n
