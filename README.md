@@ -29,6 +29,19 @@ Generic category Verbas and cores use this shared catalog. Provider-specific Ver
 
 Tater owns user organization on top of the provider data. Integrations should report the native provider room/area and stable device names, while Tater's Integrations > Organize UI stores user aliases, room renames, room merges, device renames, and preferred media players. Do not write those Tater aliases back into integration modules.
 
+## Shelly discovery and polling
+
+Shelly inventory refreshes, connection tests, and device actions contact saved
+hosts directly. They never start a subnet scan, including when a device is
+offline, a target is missing, or a previous discovery record is old or unavailable.
+Previously discovered hosts remain available across restarts and upgrades.
+
+Use **Discover Shelly Devices** to run a one-time local network scan and save
+new hosts, or enter addresses in **Manual Device Hosts**. After adding devices or
+changing their IP addresses, run Discover again or update their saved hosts.
+Name, room, credential, and enable/disable changes preserve known hosts. Editing
+the host list replaces the previous discovery record so removed hosts stay removed.
+
 ## Build a basic integration
 
 1. Create a module at `integrations/example.py`.

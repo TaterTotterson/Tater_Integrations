@@ -1,5 +1,5 @@
 from __future__ import annotations
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 import contextlib
 import ipaddress
@@ -17,7 +17,6 @@ from helpers import redis_client
 
 SHELLY_SETTINGS_KEY = "shelly_settings"
 SHELLY_DISCOVERY_CACHE_KEY = "tater:shelly:devices:registry:v1"
-SHELLY_DISCOVERY_CACHE_TTL_SECONDS = 60.0
 SHELLY_DEFAULT_ENABLED = True
 SHELLY_DEFAULT_TIMEOUT_SECONDS = 5
 SHELLY_DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 3
@@ -44,7 +43,7 @@ INTEGRATION = {
             "default": "",
             "rows": 4,
             "placeholder": "192.168.1.42\nshellyplus1pm-a8032ab12345.local",
-            "description": "Optional. One Shelly IP, host, or URL per line. Discovery also scans local private /24 networks.",
+            "description": "One Shelly IP, host, or URL per line. Refreshes check saved devices directly. Use Discover Shelly Devices to find new devices on the network.",
             "full_width": True,
         },
         {
@@ -101,7 +100,7 @@ INTEGRATION = {
         {
             "id": "discover",
             "label": "Discover Shelly Devices",
-            "status": "Scans local networks and saves discovered Shelly hosts.",
+            "status": "Runs a one-time local network scan and saves discovered Shelly hosts.",
         },
         {
             "id": "test",
@@ -376,8 +375,13 @@ def save_shelly_settings(
         ),
     }
     store.hset(SHELLY_SETTINGS_KEY, mapping=next_settings)
-    with contextlib.suppress(Exception):
-        store.delete(SHELLY_DISCOVERY_CACHE_KEY)
+    old_hosts = {root.lower() for root in _split_manual_hosts(current.get("SHELLY_DEVICE_HOSTS"))}
+    new_hosts = {root.lower() for root in _split_manual_hosts(next_settings.get("SHELLY_DEVICE_HOSTS"))}
+    if old_hosts != new_hosts:
+        # An edited host list is authoritative, including removals. Names,
+        # rooms, credentials, and enable/disable must not forget known hosts.
+        with contextlib.suppress(Exception):
+            store.delete(SHELLY_DISCOVERY_CACHE_KEY)
     return read_shelly_settings(store)
 
 
@@ -551,6 +555,11 @@ def _cache_roots(roots: List[str]) -> None:
 
 
 def _cached_roots() -> Optional[List[str]]:
+    """Read known hosts, including records written by older integration versions.
+
+    Discovery records persist until the host list is edited. Their timestamps
+    record discovery time, not device health: inventory checks health directly.
+    """
     try:
         raw = redis_client.get(SHELLY_DISCOVERY_CACHE_KEY)
         payload = json.loads(raw) if raw else {}
@@ -558,27 +567,21 @@ def _cached_roots() -> Optional[List[str]]:
         return None
     if not isinstance(payload, dict):
         return None
-    try:
-        ts = float(payload.get("ts") or 0.0)
-    except Exception:
-        ts = 0.0
-    if ts <= 0.0 or (time.time() - ts) > SHELLY_DISCOVERY_CACHE_TTL_SECONDS:
-        return None
     roots = payload.get("roots")
     if not isinstance(roots, list):
         return None
-    return _dedupe_roots(roots)
+    return _dedupe_roots([root for root in roots if isinstance(root, str)])
 
 
 def discover_shelly_roots(*, force: bool = False, settings: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Return known hosts; only an explicit discovery request scans the subnet."""
     conf = settings or read_shelly_settings()
     if not _as_bool(conf.get("SHELLY_ENABLED"), SHELLY_DEFAULT_ENABLED):
         return []
     manual = _split_manual_hosts(conf.get("SHELLY_DEVICE_HOSTS"))
+    known = _cached_roots() or []
     if not force:
-        cached = _cached_roots()
-        if cached is not None:
-            return _dedupe_roots(manual + cached)
+        return _dedupe_roots(manual + known)
     timeout = _bounded_int(
         conf.get("SHELLY_DISCOVERY_TIMEOUT_SECONDS"),
         default=SHELLY_DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
@@ -586,9 +589,10 @@ def discover_shelly_roots(*, force: bool = False, settings: Optional[Dict[str, A
         maximum=10,
     )
     discovered = _discover_shelly_roots_subnet(conf, timeout)
-    roots = _dedupe_roots(manual + discovered)
-    _cache_roots(roots)
-    return roots
+    # A temporary outage during a manual scan must not forget an existing host.
+    known = _dedupe_roots(known + discovered)
+    _cache_roots(known)
+    return _dedupe_roots(manual + known)
 
 
 def _fetch_shelly_device(root: str, settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -1162,31 +1166,32 @@ def _find_root_for_target(device_key: str, payload: Dict[str, Any], settings: Di
     if root:
         return root
     wanted = _slug(device_key)
-    roots: List[str] = []
-    for force in (False, True):
-        roots = _dedupe_roots(roots + discover_shelly_roots(force=force, settings=settings))
-        for candidate in roots:
-            try:
-                info = _shelly_request("GET", candidate, "/shelly", settings=settings)
-            except Exception:
-                continue
-            if not isinstance(info, dict):
-                continue
-            aliases = {
-                _slug(info.get("id")),
-                _slug(info.get("mac")),
-                _slug(info.get("type")),
-                _slug(info.get("model")),
-                _slug(urlparse(candidate).hostname),
-            }
-            friendly = _device_alias(candidate, info, settings)
-            if friendly:
-                aliases.add(_slug(friendly))
-            if wanted and wanted in aliases:
-                return candidate
-        if len(roots) == 1 and not wanted:
-            return roots[0]
-    raise ValueError(f"Shelly device was not found: {device_key}")
+    roots = discover_shelly_roots(settings=settings)
+    for candidate in roots:
+        try:
+            info = _shelly_request("GET", candidate, "/shelly", settings=settings)
+        except Exception:
+            continue
+        if not isinstance(info, dict):
+            continue
+        aliases = {
+            _slug(info.get("id")),
+            _slug(info.get("mac")),
+            _slug(info.get("type")),
+            _slug(info.get("model")),
+            _slug(urlparse(candidate).hostname),
+        }
+        friendly = _device_alias(candidate, info, settings)
+        if friendly:
+            aliases.add(_slug(friendly))
+        if wanted and wanted in aliases:
+            return candidate
+    if len(roots) == 1 and not wanted:
+        return roots[0]
+    raise ValueError(
+        f"Shelly device was not found: {device_key}. "
+        "Use Discover Shelly Devices or update Manual Device Hosts."
+    )
 
 
 def _action_to_on(action: str) -> Optional[bool]:
@@ -1375,17 +1380,19 @@ def save_integration_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
 def integration_status() -> Dict[str, Any]:
     settings = read_shelly_settings()
     enabled = _as_bool(settings.get("SHELLY_ENABLED"), SHELLY_DEFAULT_ENABLED)
-    manual_count = len(_split_manual_hosts(settings.get("SHELLY_DEVICE_HOSTS")))
+    known_count = len(discover_shelly_roots(settings=settings))
     alias_count = len(_parse_device_aliases(settings.get("SHELLY_DEVICE_ALIASES")))
     alias_text = f", {alias_count} named" if alias_count else ""
+    if not enabled:
+        message = "Shelly is disabled."
+    elif known_count:
+        message = f"Shelly is enabled with {known_count} saved host{'s' if known_count != 1 else ''}{alias_text}."
+    else:
+        message = "Add Manual Device Hosts or choose Discover Shelly Devices to find devices."
     return {
         "enabled": enabled,
         "configured": enabled,
-        "message": (
-            f"Shelly is enabled with {manual_count} manual host{'s' if manual_count != 1 else ''}{alias_text}."
-            if enabled
-            else "Shelly is disabled."
-        ),
+        "message": message,
     }
 
 
@@ -1395,6 +1402,8 @@ def integration_devices() -> Dict[str, Any]:
         return {"devices": [], "message": "Shelly is disabled."}
     devices, failures = shelly_inventory(force=False)
     message = f"Shelly returned {len(devices)} controllable device resource{'s' if len(devices) != 1 else ''}."
+    if not devices and not failures:
+        message = "Add Manual Device Hosts or choose Discover Shelly Devices to find devices."
     if failures:
         message += f" {len(failures)} host{'s' if len(failures) != 1 else ''} failed."
     return {"devices": devices, "message": message, "warnings": failures}
@@ -1408,6 +1417,7 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
         save_integration_settings(payload)
     if action == "discover":
         devices, failures = shelly_inventory(force=True)
+        known_roots = _cached_roots() or []
         roots = sorted({_text((item.get("details") or {}).get("root_url")) for item in devices if isinstance(item.get("details"), dict)})
         roots = [root for root in roots if root]
         current_settings = read_shelly_settings()
@@ -1427,6 +1437,9 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
                 device_aliases=alias_template,
                 device_rooms=room_template,
             )
+        # Saving newly discovered hosts may invalidate the previous registry;
+        # retain any previously known hosts that were offline during this scan.
+        _cache_roots(_dedupe_roots(known_roots + roots))
         saved_settings = read_integration_settings()
         blank_alias_count = sum(
             1
@@ -1462,9 +1475,9 @@ def run_integration_action(action_id: str, payload: Dict[str, Any]) -> Dict[str,
             ),
         }
 
-    roots = discover_shelly_roots(force=True)
+    roots = discover_shelly_roots()
     if not roots:
-        raise RuntimeError("Shelly test did not find any devices. Add manual hosts or check local network discovery.")
+        raise RuntimeError("No Shelly hosts are saved. Add Manual Device Hosts or use Discover Shelly Devices first.")
     settings = read_shelly_settings()
     item = _fetch_shelly_device(roots[0], settings)
     info = item.get("info") if isinstance(item.get("info"), dict) else {}
